@@ -1,0 +1,63 @@
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import { jsonToHtml } from './controllers/jsonToHtml';
+import { jsonToMjml } from './controllers/jsonToMjml';
+import * as webhook from './controllers/integrations/webhook';
+import { makePlatformController } from './controllers/integrations/factory';
+
+import * as mailerlite from './integrations/mailerlite';
+import * as mailerliteClassic from './integrations/mailerlite-classic';
+import * as sendgrid from './integrations/sendgrid';
+import * as postmark from './integrations/postmark';
+import * as brevo from './integrations/brevo';
+import * as mailjet from './integrations/mailjet';
+import * as onesignal from './integrations/onesignal';
+import * as airship from './integrations/airship';
+import * as activecampaign from './integrations/activecampaign';
+import * as stripo from './integrations/stripo';
+import * as marketo from './integrations/marketo';
+
+const app = express();
+const port = Number(process.env.PORT) || 4000;
+const frontendOrigin = process.env.FRONTEND_ORIGIN || 'http://localhost:5173';
+
+app.use(cors({ origin: frontendOrigin }));
+app.use(express.json({ limit: '5mb' }));
+
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', service: 'sendmymail-backend' });
+});
+
+// MJML pipeline (preview / copy)
+app.post('/getHtml', jsonToHtml);
+app.post('/getMjml', jsonToMjml);
+
+// Tier 4 — generic webhooks (Custom Webhook, Zapier, Make all use this)
+app.post('/integrations/webhook/send', webhook.send);
+
+// Tier 1 — every platform has the same /test + /send shape
+const tier1Platforms = [
+  ['mailerlite', mailerlite],
+  ['mailerlite-classic', mailerliteClassic],
+  ['sendgrid', sendgrid],
+  ['postmark', postmark],
+  ['brevo', brevo],
+  ['mailjet', mailjet],
+  ['onesignal', onesignal],
+  ['airship', airship],
+  ['activecampaign', activecampaign],
+  ['stripo', stripo],
+  ['marketo', marketo],
+] as const;
+
+for (const [slug, integration] of tier1Platforms) {
+  const ctrl = makePlatformController(integration);
+  app.post(`/integrations/${slug}/test`, ctrl.test);
+  app.post(`/integrations/${slug}/send`, ctrl.send);
+}
+
+app.listen(port, () => {
+  console.log(`sendmymail-backend listening on http://localhost:${port}`);
+  console.log(`  Tier 1 wired: ${tier1Platforms.map(([s]) => s).join(', ')}`);
+});
