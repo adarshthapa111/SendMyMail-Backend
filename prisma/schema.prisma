@@ -1,0 +1,248 @@
+// SendMyMail — database schema
+// ─────────────────────────────────────────────────────────────────────────────
+// Mirror of doc/architecture/auth-flow-and-schema.md §9 + roles-and-permissions.md
+// Option B (user_client_scopes join table for per-client scoping).
+//
+// Conventions:
+//  - IDs use cuid() (collision-resistant unique). The docs prescribe ULID with
+//    prefixes (agc_, usr_, cli_) but Prisma doesn't support that natively.
+//    cuid() is sortable + URL-safe + collision-resistant — fine for V1.
+//  - snake_case in Postgres (via @map), camelCase in TypeScript.
+//  - JSON columns use Postgres JSONB under the hood.
+//  - Server-enforced CHECK constraints (e.g. "owner/admin must have scope=all")
+//    aren't declarable in Prisma; for V1 we enforce them in application code
+//    and may add a follow-up SQL migration for the CHECK later.
+// ─────────────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ───────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  owner
+  admin
+  member
+  viewer
+}
+
+enum ScopeType {
+  all
+  clients
+}
+
+enum AgencyPlan {
+  trial
+  starter
+  growth
+  scale
+}
+
+enum ClientStatus {
+  trial
+  active
+  paused
+  archived
+}
+
+enum InvitationRole {
+  admin
+  member
+  viewer
+}
+
+enum OAuthProvider {
+  google
+  // microsoft  — add post-V1
+}
+
+// ─── Tenant + users ──────────────────────────────────────────────────────────
+
+model Agency {
+  id            String     @id @default(cuid())
+  name          String
+  country       String     @default("NP") @db.Char(2) // ISO-3166 alpha-2
+  billingEmail  String     @map("billing_email")
+  plan          AgencyPlan @default(trial)
+  trialEndsAt   DateTime?  @map("trial_ends_at")
+  setupComplete Boolean    @default(false) @map("setup_complete")
+  subdomain     String?    @unique
+  brandingJson  Json?      @map("branding_json")
+  createdAt     DateTime   @default(now()) @map("created_at")
+  updatedAt     DateTime   @updatedAt @map("updated_at")
+
+  users       User[]
+  clients     Client[]
+  invitations Invitation[]
+  auditLogs   AuditLog[]
+
+  @@map("agencies")
+  @@index([subdomain])
+}
+
+model User {
+  id               String    @id @default(cuid())
+  agencyId         String    @map("agency_id")
+  email            String    @unique
+  emailVerified    Boolean   @default(false) @map("email_verified")
+  passwordHash     String?   @map("password_hash") // nullable for OAuth-only users
+  name             String
+  role             UserRole
+  scopeType        ScopeType @default(all) @map("scope_type")
+  avatarUrl        String?   @map("avatar_url")
+  lastLoginAt      DateTime? @map("last_login_at")
+  failedLoginCount Int       @default(0) @map("failed_login_count")
+  lockedUntil      DateTime? @map("locked_until")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  agency              Agency              @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  oauthIdentities     OAuthIdentity[]
+  clientScopes        UserClientScope[]   @relation("ScopedClients")
+  emailVerifications  EmailVerification[]
+  passwordResets      PasswordReset[]
+  invitationsSent     Invitation[]        @relation("Inviter")
+  invitationsAccepted Invitation[]        @relation("Acceptor")
+  auditLogs           AuditLog[]
+  scopesGranted       UserClientScope[]   @relation("ScopeGranter")
+
+  @@map("users")
+  @@index([agencyId])
+  @@index([email])
+}
+
+model OAuthIdentity {
+  id            String        @id @default(cuid())
+  userId        String        @map("user_id")
+  provider      OAuthProvider
+  providerUid   String        @map("provider_uid")   // Google's stable 'sub' claim
+  providerEmail String        @map("provider_email") // email at provider, for display
+  linkedAt      DateTime      @default(now()) @map("linked_at")
+  lastUsedAt    DateTime?     @map("last_used_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("oauth_identities")
+  @@unique([provider, providerUid]) // one Google account → one user
+  @@index([userId])
+}
+
+// ─── Tenant resources ────────────────────────────────────────────────────────
+
+model Client {
+  id          String       @id @default(cuid())
+  agencyId    String       @map("agency_id")
+  name        String
+  slug        String                          // URL-safe identifier
+  domain      String?                         // sending domain (mail.khukrispices.com)
+  avatarColor String?      @map("avatar_color")
+  status      ClientStatus @default(trial)
+  createdAt   DateTime     @default(now()) @map("created_at")
+  updatedAt   DateTime     @updatedAt @map("updated_at")
+
+  agency     Agency            @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  userScopes UserClientScope[]
+
+  @@map("clients")
+  @@unique([agencyId, slug])    // slug unique within an agency
+  @@index([agencyId])
+}
+
+model UserClientScope {
+  userId    String   @map("user_id")
+  clientId  String   @map("client_id")
+  grantedAt DateTime @default(now()) @map("granted_at")
+  grantedBy String?  @map("granted_by")
+
+  user    User   @relation("ScopedClients", fields: [userId], references: [id], onDelete: Cascade)
+  client  Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  granter User?  @relation("ScopeGranter", fields: [grantedBy], references: [id], onDelete: SetNull)
+
+  @@id([userId, clientId])
+  @@map("user_client_scopes")
+  @@index([clientId])
+}
+
+// ─── Short-lived tokens ──────────────────────────────────────────────────────
+
+model EmailVerification {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id")
+  code      String   @db.Char(6)              // 000000 – 999999
+  expiresAt DateTime @map("expires_at")       // 15 min from issue
+  attempts  Int      @default(0)              // max 5
+  used      Boolean  @default(false)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("email_verifications")
+  @@index([userId, used])
+}
+
+model PasswordReset {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id")
+  tokenHash String   @unique @map("token_hash") // SHA-256 of URL token, never raw
+  expiresAt DateTime @map("expires_at")          // 1 hour from issue
+  used      Boolean  @default(false)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("password_resets")
+  @@index([userId, used])
+}
+
+model Invitation {
+  id             String         @id @default(cuid())
+  agencyId       String         @map("agency_id")
+  inviterUserId  String?        @map("inviter_user_id")
+  email          String                          // lowercased at insert
+  role           InvitationRole                  // captured at invite time
+  scope          Json                            // { type: "all" } OR { type: "clients", ids: ["cli_..."] }
+  tokenHash      String         @unique @map("token_hash")
+  expiresAt      DateTime       @map("expires_at") // 7 days
+  acceptedAt     DateTime?      @map("accepted_at")
+  acceptedUserId String?        @map("accepted_user_id")
+  revokedAt      DateTime?      @map("revoked_at")
+  supersededAt   DateTime?      @map("superseded_at")
+  note           String?                         // optional personal message in email
+  createdAt      DateTime       @default(now()) @map("created_at")
+
+  agency     Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  inviter    User?  @relation("Inviter", fields: [inviterUserId], references: [id], onDelete: SetNull)
+  acceptedBy User?  @relation("Acceptor", fields: [acceptedUserId], references: [id])
+
+  @@map("invitations")
+  @@index([agencyId, acceptedAt])
+  @@index([email, acceptedAt])
+}
+
+// ─── Audit trail ─────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id          BigInt   @id @default(autoincrement())
+  agencyId    String   @map("agency_id")
+  actorUserId String?  @map("actor_user_id")
+  action      String   // e.g. "auth.login" / "team.invite_sent" / "campaign.sent"
+  targetType  String?  @map("target_type")
+  targetId    String?  @map("target_id")
+  metadata    Json?
+  ip          String?
+  userAgent   String?  @map("user_agent")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  actor  User?  @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@map("audit_log")
+  @@index([agencyId, createdAt(sort: Desc)])
+  @@index([actorUserId, createdAt(sort: Desc)])
+}

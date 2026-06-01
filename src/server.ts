@@ -1,6 +1,9 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import { authRouter } from './routes/auth';
+import { agenciesRouter } from './routes/agencies';
+import { errorHandler, requestId } from './lib/errors';
 import { jsonToHtml } from './controllers/jsonToHtml';
 import { jsonToMjml } from './controllers/jsonToMjml';
 import * as webhook from './controllers/integrations/webhook';
@@ -24,10 +27,15 @@ const frontendOrigin = process.env.FRONTEND_ORIGIN || 'http://localhost:5173';
 
 app.use(cors({ origin: frontendOrigin }));
 app.use(express.json({ limit: '5mb' }));
+app.use(requestId);
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'sendmymail-backend' });
 });
+
+// Auth + agency setup (v1 API)
+app.use('/v1/auth', authRouter);
+app.use('/v1/agencies', agenciesRouter);
 
 // MJML pipeline (preview / copy)
 app.post('/getHtml', jsonToHtml);
@@ -56,6 +64,10 @@ for (const [slug, integration] of tier1Platforms) {
   app.post(`/integrations/${slug}/test`, ctrl.test);
   app.post(`/integrations/${slug}/send`, ctrl.send);
 }
+
+// Error handler — must be the LAST middleware. Formats any thrown ApiError /
+// ZodError / unknown error into our shared { error: { code, message, ... }, request_id } shape.
+app.use(errorHandler);
 
 app.listen(port, () => {
   console.log(`sendmymail-backend listening on http://localhost:${port}`);
