@@ -1,31 +1,65 @@
-/* Transactional email dispatch — V1 stub.
-   In dev: logs to console (so you can grab verification codes / reset URLs / invite URLs from the backend terminal).
-   In prod: TODO — wire up SendGrid / Resend / our own MJML pipeline.
-   The signatures below stay the same when the real transport lands. */
+import { Resend } from 'resend';
+
+/* Transactional email dispatch.
+   ─────────────────────────────────────────────────────────────────────────
+   - If RESEND_API_KEY is set → send via Resend.
+   - Otherwise (or if Resend rejects) → console-log fallback (devs without
+     a Resend account still get the codes / links in their backend terminal).
+
+   FROM address:
+     - When EMAIL_FROM env is set, we use it.
+     - Otherwise we use Resend's onboarding sender 'onboarding@resend.dev'.
+       NOTE: with Resend's free tier + unverified domain, you can only send to
+       the email you signed up to Resend with. To send to any inbox, verify
+       a sending domain in the Resend dashboard and set EMAIL_FROM in .env.
+   ───────────────────────────────────────────────────────────────────────── */
 
 const APP_URL = process.env.APP_URL || 'http://localhost:5173';
-const FROM = 'SendMyMail <noreply@sendmymail.io>';
+const FROM    = process.env.EMAIL_FROM || 'SendMyMail <onboarding@resend.dev>';
+const RESEND_KEY = process.env.RESEND_API_KEY;
+
+const resend: Resend | null = RESEND_KEY ? new Resend(RESEND_KEY) : null;
 
 interface EmailJob {
   to: string;
   subject: string;
   text: string;
-  // html?: string;  — real transport will add this
+  html?: string;
 }
 
-async function dispatch(job: EmailJob): Promise<void> {
-  if (process.env.NODE_ENV === 'production') {
-    // TODO: real transport
-    throw new Error('Email transport not yet wired for production');
-  }
-  // Dev: dump to console so the developer can grab codes / links.
+function consoleStub(job: EmailJob, reason: string): void {
   console.log('\n┌─────────────────────────────────────────────────────────────');
-  console.log(`│ 📧 [email stub]  →  ${job.to}`);
+  console.log(`│ 📧 [email ${reason}]  →  ${job.to}`);
   console.log(`│    From:    ${FROM}`);
   console.log(`│    Subject: ${job.subject}`);
   console.log(`├─────────────────────────────────────────────────────────────`);
   job.text.split('\n').forEach(line => console.log(`│ ${line}`));
   console.log('└─────────────────────────────────────────────────────────────\n');
+}
+
+async function dispatch(job: EmailJob): Promise<void> {
+  if (!resend) {
+    consoleStub(job, 'stub — RESEND_API_KEY not set');
+    return;
+  }
+  try {
+    const result = await resend.emails.send({
+      from:    FROM,
+      to:      job.to,
+      subject: job.subject,
+      text:    job.text,
+      ...(job.html ? { html: job.html } : {}),
+    });
+    if (result.error) {
+      console.error('[email] Resend error:', result.error);
+      consoleStub(job, `Resend failed → ${result.error.message ?? 'unknown'}`);
+      return;
+    }
+    console.log(`📧 [email sent via Resend] ${job.subject} → ${job.to} (id: ${result.data?.id})`);
+  } catch (err) {
+    console.error('[email] Resend exception:', err);
+    consoleStub(job, 'Resend threw — falling back');
+  }
 }
 
 /* ─── The 3 transactional emails ─────────────────────────────────────────── */

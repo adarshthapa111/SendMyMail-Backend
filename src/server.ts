@@ -3,6 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import { authRouter } from './routes/auth';
 import { agenciesRouter } from './routes/agencies';
+import { invitationsRouter } from './routes/invitations';
 import { errorHandler, requestId } from './lib/errors';
 import { jsonToHtml } from './controllers/jsonToHtml';
 import { jsonToMjml } from './controllers/jsonToMjml';
@@ -33,9 +34,10 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'sendmymail-backend' });
 });
 
-// Auth + agency setup (v1 API)
+// Auth + agency setup + team management (v1 API)
 app.use('/v1/auth', authRouter);
 app.use('/v1/agencies', agenciesRouter);
+app.use('/v1/team/invitations', invitationsRouter);
 
 // MJML pipeline (preview / copy)
 app.post('/getHtml', jsonToHtml);

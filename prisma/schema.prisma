@@ -215,6 +215,7 @@ model Invitation {
   supersededAt   DateTime?      @map("superseded_at")
   note           String?                         // optional personal message in email
   createdAt      DateTime       @default(now()) @map("created_at")
+  updatedAt      DateTime       @updatedAt @map("updated_at") // bumps on resend — rate-limit reference
 
   agency     Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   inviter    User?  @relation("Inviter", fields: [inviterUserId], references: [id], onDelete: SetNull)

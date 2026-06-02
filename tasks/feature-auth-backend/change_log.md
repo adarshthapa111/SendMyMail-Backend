@@ -84,6 +84,96 @@ After all 6 sub-PRs:
 
 ## Changes (newest first)
 
+### 2026-06-01 · ✅ Done — PR 2 (Auth Extensions) shipped + smoke-tested
+
+**Google OAuth + team invitations — 9 endpoints, 3 new files, 1 schema migration.** Full happy path verified end-to-end with curl.
+
+| Layer | Files |
+|---|---|
+| Helpers | `src/lib/oauthState.ts` (short-lived signed JWT carrying OAuth nonce + optional invite token) · `src/lib/google.ts` (OAuth URL builder + code-to-ID-token exchange via google-auth-library) |
+| Routes | `src/routes/invitations.ts` (5 team-side endpoints) · `src/routes/auth.ts` extended with 4 endpoints (Google start/callback + public invite view/accept) |
+| Schema | New migration `20260601135155_invitations_add_updated_at` adds `invitations.updated_at` — bumped on each resend to enforce the cooldown |
+| Wiring | `src/server.ts` mounts `/v1/team/invitations` |
+| Env | `.env.example` updated with `GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET` + `BACKEND_URL` + full Google Cloud setup walkthrough |
+
+**Endpoints shipped (9 total):**
+
+| Method | Path | What it does |
+|---|---|---|
+| GET  | `/v1/auth/google/start` | Packs OAuth state (+ optional `?invite=<token>`) → 302 to Google. Returns `500 google_oauth_not_configured` with clear message if env vars missing. |
+| GET  | `/v1/auth/google/callback` | The 3-branch decision tree from auth-flow §3: (1) OAuth row exists → sign in · (2) email exists, no OAuth row → auto-link · (3a) brand-new + invite → accept invitation · (3b) brand-new + no invite → create new agency + Owner. Returns JWT via URL fragment redirect to `${APP_URL}/auth/google/done#jwt=...` |
+| POST | `/v1/team/invitations` | Owner/Admin only. Validates role + scope (Admin must have `scope=all`, Admin-invites-Admin rejected unless inviter is Owner, all `clientId`s verified to belong to the agency). Auto-supersedes any existing pending invite for the same (agency, email). |
+| GET  | `/v1/team/invitations` | Lists pending invitations for the agency with inviter info |
+| PATCH | `/v1/team/invitations/:id` | Edit role/scope of a pending invite (re-runs the validation rules) |
+| POST | `/v1/team/invitations/:id/resend` | Rotates the token (we never stored the raw — generates a new one), extends expiry, re-sends email. 5-min per-invitation cooldown via `invitations.updated_at`. |
+| POST | `/v1/team/invitations/:id/revoke` | Marks `revoked_at = now()`. Idempotent (re-revoke returns `alreadyRevoked: true`). |
+| GET  | `/v1/auth/invitations/:token` | Public — returns `{ agencyName, inviterName, inviterEmail, inviteeEmail, role, scope, note, expiresAt }`. 404 `invitation_invalid` / 410 `invitation_already_accepted` / `invitation_revoked` / `invitation_expired`. |
+| POST | `/v1/auth/invitations/:token/accept` | Public — creates user under invite's agency with locked-at-invite-time role + scope. If `scope.type='clients'`, creates `user_client_scopes` rows. Marks invitation accepted. Returns JWT. |
+
+**Decisions made during implementation:**
+
+- **Resend rotates the token.** We can't recover the raw token (only SHA-256 hashes are stored). Resend generates a new token + new hash + new expiry. Stronger security than "same token" with no UX downside.
+- **`invitations.updated_at` added.** Resend cooldown needs a "last-touched" timestamp. `createdAt` alone only protects the first resend. Migration is trivial (one column added).
+- **OAuth state uses a signed JWT, not a cookie.** Stateless backend. Carries the random nonce + optional invite token. 10-min TTL.
+- **Callback redirects with JWT in URL fragment.** `${APP_URL}/auth/google/done#jwt=...` — fragments never reach servers (browser strips them on GET), so JWT doesn't leak via Referer. Frontend reads `window.location.hash`, swaps into `localStorage`, `replaceState`s to clear.
+- **Admin invite rules enforced server-side** (in addition to UI): Admins can only invite Member/Viewer; Admins require `scope=all`; only Owners can promote-via-invite to Admin.
+- **Email mismatch on OAuth-with-invite** — if Google's email ≠ invitation's email, redirect with `invitation_email_mismatch`. User must use the invited email.
+- **Brand-new Google user without invite** = new agency + Owner immediately. No additional verification (Google verified the email).
+
+**Smoke test results (15 scenarios, all passed):**
+
+```
+═══ Invite happy path ═══
+1.  Sign up Owner → verify → workspace-setup            ✅
+2.  Owner POSTs /v1/team/invitations                    ✅ created
+3.  GET /v1/team/invitations                            ✅ 1 pending
+4.  Token grabbed from email stub log                   ✅
+5.  GET /v1/auth/invitations/:token (public)            ✅ full context returned
+6.  POST /v1/auth/invitations/:token/accept             ✅ Member user created
+7.  New user → GET /v1/auth/me                          ✅ role=member, agency=Owner's
+8.  New user logs in with password                      ✅ JWT issued
+9.  Try re-accept same token                            ✅ rejected
+10. GET /v1/team/invitations                            ✅ empty (consumed)
+
+═══ Resend / Revoke / Patch ═══
+a. Immediate resend                                     ✅ 400 resend_too_soon
+b. Revoke fresh invite                                  ✅ revoked: true
+c. View revoked token                                   ✅ 410 invitation_revoked
+d. PATCH role member → viewer                           ✅ updated
+
+═══ Google OAuth (without creds — happy error path) ═══
+e. GET /v1/auth/google/start, no GOOGLE_CLIENT_ID       ✅ 500 google_oauth_not_configured
+   with actionable message: "Add GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET to .env"
+```
+
+---
+
+## Setting up Google OAuth for real (one-time, ~10 min)
+
+The endpoints work without changes — they just need real credentials.
+
+1. Go to [console.cloud.google.com](https://console.cloud.google.com/) → create / pick a project
+2. **APIs & Services → OAuth consent screen** → fill in:
+   - User Type: **External** (for V1)
+   - App name: `SendMyMail`
+   - Support email: your email
+   - Scopes: add `openid`, `email`, `profile`
+   - Test users: your own email (until you publish the app)
+3. **APIs & Services → Credentials → Create credentials → OAuth client ID**:
+   - Application type: **Web application**
+   - Name: `SendMyMail Dev`
+   - Authorized redirect URI: `http://localhost:4000/v1/auth/google/callback`
+4. Copy the resulting **Client ID** + **Client Secret** into `.env`:
+   ```env
+   GOOGLE_CLIENT_ID="1234567...apps.googleusercontent.com"
+   GOOGLE_CLIENT_SECRET="GOCSPX-..."
+   ```
+5. Restart `npm run dev`. `GET /v1/auth/google/start` now 302s to Google's consent screen.
+
+For prod: repeat with `Authorized redirect URI: https://api.sendmymail.io/v1/auth/google/callback` and stash those creds into your production env.
+
+---
+
 ### 2026-06-01 · ✅ Done — PR 1 (Auth Core) shipped + smoke-tested
 
 **What landed: 8 endpoints, 12 new source files, full happy-path verified with curl.**
