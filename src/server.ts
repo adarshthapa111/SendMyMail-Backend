@@ -6,6 +6,7 @@ import { agenciesRouter } from './routes/agencies';
 import { invitationsRouter } from './routes/invitations';
 import { clientsRouter } from './routes/clients';
 import { contactsRouter } from './routes/contacts';
+import { contactImportsRouter } from './routes/contactImports';
 import { listsRouter } from './routes/lists';
 import { tagsRouter } from './routes/tags';
 import { errorHandler, requestId } from './lib/errors';
@@ -43,9 +44,13 @@ app.use('/v1/auth', authRouter);
 app.use('/v1/agencies', agenciesRouter);
 app.use('/v1/team/invitations', invitationsRouter);
 app.use('/v1/clients', clientsRouter);
-app.use('/v1/clients/:clientId/contacts', contactsRouter);
-app.use('/v1/clients/:clientId/lists',    listsRouter);
-app.use('/v1/clients/:clientId/tags',     tagsRouter);
+// IMPORTANT: mount the imports sub-router BEFORE the contacts CRUD router —
+// /contacts/imports must match before the /contacts/:id read handler grabs
+// "imports" as an :id.
+app.use('/v1/clients/:clientId/contacts/imports', contactImportsRouter);
+app.use('/v1/clients/:clientId/contacts',         contactsRouter);
+app.use('/v1/clients/:clientId/lists',            listsRouter);
+app.use('/v1/clients/:clientId/tags',             tagsRouter);
 
 // MJML pipeline (preview / copy)
 app.post('/getHtml', jsonToHtml);

@@ -73,6 +73,14 @@ enum ListMembershipStatus {
   pending        // confirmation pending — reserved for double-opt-in
 }
 
+enum ImportJobStatus {
+  pending      // file uploaded, not yet started
+  parsing      // detecting headers + counting rows + quality check
+  importing    // inserting contacts in chunks
+  done
+  failed       // either rejected by quality check or threw during import
+}
+
 // ─── Tenant + users ──────────────────────────────────────────────────────────
 
 model Agency {
@@ -93,6 +101,7 @@ model Agency {
   invitations Invitation[]
   auditLogs   AuditLog[]
   contacts    Contact[]
+  importJobs  ImportJob[]
 
   @@map("agencies")
   @@index([subdomain])
@@ -123,6 +132,7 @@ model User {
   invitationsAccepted Invitation[]        @relation("Acceptor")
   auditLogs           AuditLog[]
   scopesGranted       UserClientScope[]   @relation("ScopeGranter")
+  importJobs          ImportJob[]
 
   @@map("users")
   @@index([agencyId])
@@ -163,6 +173,7 @@ model Client {
   contacts   Contact[]
   lists      List[]
   tags       Tag[]
+  importJobs ImportJob[]
 
   @@map("clients")
   @@unique([agencyId, slug])    // slug unique within an agency
@@ -304,8 +315,9 @@ model List {
   createdAt   DateTime @default(now()) @map("created_at")
   updatedAt   DateTime @updatedAt @map("updated_at")
 
-  client  Client        @relation(fields: [clientId], references: [id], onDelete: Cascade)
-  members ListContact[]
+  client     Client        @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  members    ListContact[]
+  importJobs ImportJob[]
 
   @@map("lists")
   @@index([clientId, archived])
@@ -350,4 +362,38 @@ model ContactTag {
   @@id([contactId, tagId])
   @@map("contact_tags")
   @@index([tagId])
+}
+
+// ─── CSV import jobs (feature-contacts-lists PR 2) ──────────────────────────
+
+model ImportJob {
+  id             String          @id @default(cuid())
+  agencyId       String          @map("agency_id")
+  clientId       String          @map("client_id")
+  listId         String?         @map("list_id")        // optional — if set, imported contacts also join this list as subscribed
+  createdBy      String          @map("created_by")     // user who initiated
+  status         ImportJobStatus @default(pending)
+  rejectedReason String?         @map("rejected_reason") // 'too_many_role_accounts' | 'invalid_csv' | 'parse_error'
+  filename       String                                  // original upload name (for the history modal)
+  fileSize       Int             @map("file_size")
+  totalRows      Int             @default(0) @map("total_rows")
+  processedRows  Int             @default(0) @map("processed_rows")
+  importedRows   Int             @default(0) @map("imported_rows")
+  skippedRows    Int             @default(0) @map("skipped_rows")     // duplicates, empty emails
+  rejectedRows   Int             @default(0) @map("rejected_rows")    // bad email format, etc.
+  columnMapping  Json            @map("column_mapping")                // { csvHeader: 'email' | 'firstName' | … | 'skip' }
+  consentText    String          @map("consent_text")                  // exact text the user agreed to (compliance)
+  errors         Json?                                                  // first 100 errors as [{ row, email, reason }]
+  startedAt      DateTime?       @map("started_at")
+  completedAt    DateTime?       @map("completed_at")
+  createdAt      DateTime        @default(now()) @map("created_at")
+
+  agency  Agency @relation(fields: [agencyId],  references: [id], onDelete: Cascade)
+  client  Client @relation(fields: [clientId],  references: [id], onDelete: Cascade)
+  creator User   @relation(fields: [createdBy], references: [id], onDelete: Cascade)
+  list    List?  @relation(fields: [listId],    references: [id], onDelete: SetNull)
+
+  @@map("import_jobs")
+  @@index([clientId, createdAt(sort: Desc)])
+  @@index([status])
 }

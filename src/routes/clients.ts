@@ -70,10 +70,14 @@ clientsRouter.get('/', requireAuth(), async (req, res, next) => {
   try {
     const agencyId = req.auth!.agency_id;
     const scope    = req.auth!.scope;
+    /* `?includeArchived=true` opts archived clients INTO the result. Default
+       behavior is unchanged — active/trial/paused only. The FE asks for
+       everything so users can browse the Archived tab without a re-fetch. */
+    const includeArchived = req.query.includeArchived === 'true' || req.query.includeArchived === '1';
 
     const where = {
       agencyId,
-      status: { not: 'archived' as const },
+      ...(includeArchived ? {} : { status: { not: 'archived' as const } }),
       ...(scope.type === 'clients' ? { id: { in: scope.ids } } : {}),
     };
 
@@ -164,6 +168,10 @@ const updateBody = z.object({
   name:        z.string().trim().min(1).max(100).optional(),
   domain:      z.string().trim().min(1).max(253).nullish(),
   avatarColor: z.string().trim().regex(/^#[0-9a-fA-F]{6}$/, 'invalid_color').nullish(),
+  /* Status is only here to support "restore" — flipping an archived client
+     back to active. Other transitions (active → paused etc.) aren't surfaced
+     in V1; the only callers are the FE restore button. */
+  status:      z.enum(['trial', 'active', 'paused']).optional(),
 }).strict();      // reject unknown keys (including slug)
 
 clientsRouter.patch('/:id', requireAuth(), requireRole('admin'), async (req, res, next) => {
@@ -176,6 +184,7 @@ clientsRouter.patch('/:id', requireAuth(), requireRole('admin'), async (req, res
     if (body.name !== undefined)        data.name        = body.name;
     if (body.domain !== undefined)      data.domain      = body.domain ?? null;
     if (body.avatarColor !== undefined) data.avatarColor = body.avatarColor ?? null;
+    if (body.status !== undefined)      data.status      = body.status;
 
     const row = await prisma.client.update({
       where: { id },
@@ -184,7 +193,7 @@ clientsRouter.patch('/:id', requireAuth(), requireRole('admin'), async (req, res
     });
 
     const changes: Prisma.InputJsonValue = {};
-    for (const key of ['name', 'domain', 'avatarColor'] as const) {
+    for (const key of ['name', 'domain', 'avatarColor', 'status'] as const) {
       if (before[key] !== row[key]) {
         (changes as Record<string, Prisma.InputJsonValue>)[key] = {
           from: before[key] ?? null,
