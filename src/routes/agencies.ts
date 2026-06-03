@@ -5,8 +5,32 @@ import { issueJwt } from '../lib/jwt';
 import { writeAudit } from '../lib/audit';
 import { requireAuth } from '../middleware/auth';
 import { notFound } from '../lib/errors';
+import { computeOverview } from '../lib/overview';
 
 export const agenciesRouter = Router();
+
+/* ─── GET /v1/agencies/overview — agency dashboard payload ──────────────── */
+
+agenciesRouter.get('/overview', requireAuth(), async (req, res, next) => {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.auth!.sub },
+      select: { name: true },
+    });
+    if (!user) throw notFound('user_not_found');
+
+    const payload = await computeOverview({
+      agencyId: req.auth!.agency_id,
+      userId:   req.auth!.sub,
+      userName: user.name,
+      scope:    req.auth!.scope,
+    });
+
+    res.json({ data: payload });
+  } catch (err) {
+    next(err);
+  }
+});
 
 /* ─── POST /v1/agencies/me — workspace setup ────────────────────────────── */
 

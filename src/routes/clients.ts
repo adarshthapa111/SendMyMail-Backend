@@ -6,6 +6,7 @@ import { requireAuth, requireRole } from '../middleware/auth';
 import { notFound, conflict } from '../lib/errors';
 import { writeAudit } from '../lib/audit';
 import { slugFromName } from '../lib/slug';
+import { invalidateOverview } from '../lib/overview';
 
 /* /v1/clients — full CRUD for clients (feature-client-management).
    READ:    GET /          (list)
@@ -149,6 +150,7 @@ clientsRouter.post('/', requireAuth(), requireRole('admin'), async (req, res, ne
       metadata:    { name: row.name, slug: row.slug },
       req,
     });
+    invalidateOverview(agencyId);   // dashboard's active-clients count + top-list need to reflect this
 
     res.status(201).json({ data: { client: serialize(row) } });
   } catch (err) {
@@ -199,6 +201,7 @@ clientsRouter.patch('/:id', requireAuth(), requireRole('admin'), async (req, res
       metadata:    { changes },
       req,
     });
+    invalidateOverview(req.auth!.agency_id);   // top_clients ordering / name shown on dashboard may have changed
 
     res.json({ data: { client: serialize(row) } });
   } catch (err) {
@@ -230,6 +233,7 @@ clientsRouter.delete('/:id', requireAuth(), requireRole('admin'), async (req, re
         metadata:    { name: archived.name },
         req,
       });
+      invalidateOverview(req.auth!.agency_id);   // active-clients count + top_clients change
     }
 
     res.json({ data: { client: serialize(archived) } });
