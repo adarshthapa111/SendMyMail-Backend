@@ -4,6 +4,7 @@ import cors from 'cors';
 import { authRouter } from './routes/auth';
 import { agenciesRouter } from './routes/agencies';
 import { invitationsRouter } from './routes/invitations';
+import { clientsRouter } from './routes/clients';
 import { errorHandler, requestId } from './lib/errors';
 import { jsonToHtml } from './controllers/jsonToHtml';
 import { jsonToMjml } from './controllers/jsonToMjml';
@@ -38,6 +39,7 @@ app.get('/health', (_req, res) => {
 app.use('/v1/auth', authRouter);
 app.use('/v1/agencies', agenciesRouter);
 app.use('/v1/team/invitations', invitationsRouter);
+app.use('/v1/clients', clientsRouter);
 
 // MJML pipeline (preview / copy)
 app.post('/getHtml', jsonToHtml);
