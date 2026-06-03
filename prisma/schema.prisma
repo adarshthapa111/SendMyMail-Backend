@@ -62,6 +62,17 @@ enum OAuthProvider {
   // microsoft  — add post-V1
 }
 
+enum ListType {
+  static     // hand-managed snapshot
+  dynamic    // rule-based, auto-updating — rule JSON ships in feature-contacts-lists PR 3
+}
+
+enum ListMembershipStatus {
+  subscribed
+  unsubscribed   // unsubscribed from this list specifically (client-scoped)
+  pending        // confirmation pending — reserved for double-opt-in
+}
+
 // ─── Tenant + users ──────────────────────────────────────────────────────────
 
 model Agency {
@@ -81,6 +92,7 @@ model Agency {
   clients     Client[]
   invitations Invitation[]
   auditLogs   AuditLog[]
+  contacts    Contact[]
 
   @@map("agencies")
   @@index([subdomain])
@@ -148,6 +160,9 @@ model Client {
 
   agency     Agency            @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   userScopes UserClientScope[]
+  contacts   Contact[]
+  lists      List[]
+  tags       Tag[]
 
   @@map("clients")
   @@unique([agencyId, slug])    // slug unique within an agency
@@ -246,4 +261,93 @@ model AuditLog {
   @@map("audit_log")
   @@index([agencyId, createdAt(sort: Desc)])
   @@index([actorUserId, createdAt(sort: Desc)])
+}
+
+// ─── Contacts, lists, tags (feature-contacts-lists) ──────────────────────────
+
+model Contact {
+  id         String    @id @default(cuid())
+  agencyId   String    @map("agency_id")
+  clientId   String    @map("client_id")
+  email      String                                 // preserves case as user typed
+  emailLower String    @map("email_lower")          // lowercased copy — uniqueness + lookups
+  firstName  String?   @map("first_name")
+  lastName   String?   @map("last_name")
+  phone      String?
+  city       String?
+  birthday   DateTime? @db.Date
+  custom     Json?                                  // ≤10 client-defined fields (cap enforced in API layer)
+  source     String?                                // 'manual' | 'csv_import' | 'form' | 'api' — V1 only manual / csv
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+  deletedAt  DateTime? @map("deleted_at")           // soft-delete; hard-delete + GDPR cascade lands in PR 3
+
+  agency      Agency       @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  client      Client       @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  listMembers ListContact[]
+  contactTags ContactTag[]
+
+  @@map("contacts")
+  @@unique([clientId, emailLower])                  // the core dedupe rule
+  @@index([clientId, deletedAt])
+  @@index([clientId, createdAt])
+}
+
+model List {
+  id          String   @id @default(cuid())
+  agencyId    String   @map("agency_id")
+  clientId    String   @map("client_id")
+  name        String
+  description String?                               // ≤200 chars (API layer)
+  type        ListType @default(static)             // dynamic rule JSON lands in PR 3
+  archived    Boolean  @default(false)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  client  Client        @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  members ListContact[]
+
+  @@map("lists")
+  @@index([clientId, archived])
+}
+
+model ListContact {
+  listId          String               @map("list_id")
+  contactId       String               @map("contact_id")
+  status          ListMembershipStatus @default(subscribed)
+  subscribedAt    DateTime             @default(now()) @map("subscribed_at")
+  unsubscribedAt  DateTime?            @map("unsubscribed_at")
+
+  list    List    @relation(fields: [listId],    references: [id], onDelete: Cascade)
+  contact Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@id([listId, contactId])
+  @@map("list_contacts")
+  @@index([contactId])
+}
+
+model Tag {
+  id        String   @id @default(cuid())
+  clientId  String   @map("client_id")
+  name      String                                  // lowercased on write; free-text
+  color     String?                                 // optional hex; FE assigns one if null
+  createdAt DateTime @default(now()) @map("created_at")
+
+  client      Client       @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  contactTags ContactTag[]
+
+  @@map("tags")
+  @@unique([clientId, name])
+}
+
+model ContactTag {
+  contactId String @map("contact_id")
+  tagId     String @map("tag_id")
+
+  contact Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  tag     Tag     @relation(fields: [tagId],     references: [id], onDelete: Cascade)
+
+  @@id([contactId, tagId])
+  @@map("contact_tags")
+  @@index([tagId])
 }
