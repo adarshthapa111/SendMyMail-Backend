@@ -102,6 +102,7 @@ model Agency {
   auditLogs   AuditLog[]
   contacts    Contact[]
   importJobs  ImportJob[]
+  templates   Template[]
 
   @@map("agencies")
   @@index([subdomain])
@@ -133,6 +134,7 @@ model User {
   auditLogs           AuditLog[]
   scopesGranted       UserClientScope[]   @relation("ScopeGranter")
   importJobs          ImportJob[]
+  templatesCreated    Template[]
 
   @@map("users")
   @@index([agencyId])
@@ -174,6 +176,7 @@ model Client {
   lists      List[]
   tags       Tag[]
   importJobs ImportJob[]
+  templates  Template[]
 
   @@map("clients")
   @@unique([agencyId, slug])    // slug unique within an agency
@@ -396,4 +399,33 @@ model ImportJob {
   @@map("import_jobs")
   @@index([clientId, createdAt(sort: Desc)])
   @@index([status])
+}
+
+/* Templates — reusable email designs (feature-templates).
+   The MJML tree is persisted as JSON in `mjml_source`. No subject /
+   preheader / from columns: those are envelope metadata owned by
+   Campaign (Feature 06). `client_id` is nullable so PR 3 can seed
+   agency-level starter templates without a follow-up migration. */
+model Template {
+  id           String   @id @default(cuid())
+  agencyId     String   @map("agency_id")
+  clientId     String?  @map("client_id")           // null = agency-level reusable (seeded later)
+  name         String                                // ≤120 chars, internal label (NOT the email subject)
+  mjmlSource   Json     @map("mjml_source")          // IMjmlNode tree, post-strip (no _id, no _meta, no mj-preview)
+  thumbnailUrl String?  @map("thumbnail_url")
+  category     String?                               // free-text V1
+  isStarter    Boolean  @default(false) @map("is_starter")
+  archived     Boolean  @default(false)
+  createdBy    String?  @map("created_by")           // null if the creating user was deleted (SetNull)
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  agency  Agency  @relation(fields: [agencyId],  references: [id], onDelete: Cascade)
+  client  Client? @relation(fields: [clientId],  references: [id], onDelete: Cascade)
+  creator User?   @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+
+  @@map("templates")
+  @@index([agencyId])
+  @@index([clientId, archived, updatedAt(sort: Desc)])  // hot path: GET list ordered by recency
+  @@index([agencyId, isStarter])                         // PR 3's starter lookup
 }
