@@ -81,6 +81,20 @@ enum ImportJobStatus {
   failed       // either rejected by quality check or threw during import
 }
 
+enum CampaignStatus {
+  draft        // wizard in progress, no recipient snapshot yet
+  scheduled    // V2 — scheduleAt set, awaiting cron / queue
+  sending      // launched, send loop running, partial counts in sentCount/failedCount
+  sent         // loop finished with ≥1 success
+  failed       // loop finished with 0 successes (all sends failed) OR pre-launch validation failed
+}
+
+enum SendStatus {
+  queued       // row inserted before send attempted (rare — we insert post-attempt V1)
+  sent         // Resend returned a messageId
+  failed       // Resend rejected or threw; reason in `error`
+}
+
 // ─── Tenant + users ──────────────────────────────────────────────────────────
 
 model Agency {
@@ -103,6 +117,7 @@ model Agency {
   contacts    Contact[]
   importJobs  ImportJob[]
   templates   Template[]
+  campaigns   Campaign[]
 
   @@map("agencies")
   @@index([subdomain])
@@ -135,6 +150,7 @@ model User {
   scopesGranted       UserClientScope[]   @relation("ScopeGranter")
   importJobs          ImportJob[]
   templatesCreated    Template[]
+  campaignsCreated    Campaign[]
 
   @@map("users")
   @@index([agencyId])
@@ -177,6 +193,7 @@ model Client {
   tags       Tag[]
   importJobs ImportJob[]
   templates  Template[]
+  campaigns  Campaign[]
 
   @@map("clients")
   @@unique([agencyId, slug])    // slug unique within an agency
@@ -296,10 +313,11 @@ model Contact {
   updatedAt  DateTime  @updatedAt @map("updated_at")
   deletedAt  DateTime? @map("deleted_at")           // soft-delete; hard-delete + GDPR cascade lands in PR 3
 
-  agency      Agency       @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  client      Client       @relation(fields: [clientId], references: [id], onDelete: Cascade)
-  listMembers ListContact[]
-  contactTags ContactTag[]
+  agency             Agency              @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  client             Client              @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  listMembers        ListContact[]
+  contactTags        ContactTag[]
+  campaignRecipients CampaignRecipient[]
 
   @@map("contacts")
   @@unique([clientId, emailLower])                  // the core dedupe rule
@@ -321,6 +339,7 @@ model List {
   client     Client        @relation(fields: [clientId], references: [id], onDelete: Cascade)
   members    ListContact[]
   importJobs ImportJob[]
+  campaigns  Campaign[]
 
   @@map("lists")
   @@index([clientId, archived])
@@ -420,12 +439,113 @@ model Template {
   createdAt    DateTime @default(now()) @map("created_at")
   updatedAt    DateTime @updatedAt @map("updated_at")
 
-  agency  Agency  @relation(fields: [agencyId],  references: [id], onDelete: Cascade)
-  client  Client? @relation(fields: [clientId],  references: [id], onDelete: Cascade)
-  creator User?   @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+  agency    Agency     @relation(fields: [agencyId],  references: [id], onDelete: Cascade)
+  client    Client?    @relation(fields: [clientId],  references: [id], onDelete: Cascade)
+  creator   User?      @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+  campaigns Campaign[]
 
   @@map("templates")
   @@index([agencyId])
   @@index([clientId, archived, updatedAt(sort: Desc)])  // hot path: GET list ordered by recency
   @@index([agencyId, isStarter])                         // PR 3's starter lookup
+}
+
+/* Campaigns — one-shot broadcasts (feature-campaigns V1).
+   The wizard builds a draft; launch snapshots recipients from the
+   referenced list and runs the send pipeline (Resend via sendRawHtml).
+
+   Envelope (fromName/fromEmail/subject/preheader) lives here, NOT on
+   Template, so one template can be sent by many campaigns with different
+   subjects. Mirrors how every ESP works.
+
+   templateId + listId are SetNull on delete so campaigns survive their
+   sources being archived — the snapshot in CampaignRecipient is already
+   frozen, and sent campaigns aren't re-rendered. */
+model Campaign {
+  id        String   @id @default(cuid())
+  agencyId  String   @map("agency_id")
+  clientId  String   @map("client_id")
+  name      String                                       // ≤200 chars
+
+  // Envelope metadata (nullable on draft, server enforces required at launch)
+  fromName  String?  @map("from_name")
+  fromEmail String?  @map("from_email")
+  subject   String?
+  preheader String?                                       // ≤150 chars
+
+  // Content + audience
+  templateId String? @map("template_id")
+  listId     String? @map("list_id")
+
+  // Scheduling — V1 always null at launch ("Send now" only); reserved for V2
+  scheduleAt DateTime? @map("schedule_at")
+
+  // Lifecycle
+  status              CampaignStatus @default(draft)
+  recipientSnapshotAt DateTime?      @map("recipient_snapshot_at")
+  totalRecipients     Int            @default(0) @map("total_recipients")
+  sentCount           Int            @default(0) @map("sent_count")
+  failedCount         Int            @default(0) @map("failed_count")
+
+  // Soft-delete (matches templates pattern)
+  archived  Boolean  @default(false)
+
+  createdBy String?  @map("created_by")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  agency   Agency    @relation(fields: [agencyId],  references: [id], onDelete: Cascade)
+  client   Client    @relation(fields: [clientId],  references: [id], onDelete: Cascade)
+  template Template? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  list     List?     @relation(fields: [listId],    references: [id], onDelete: SetNull)
+  creator  User?     @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+
+  recipients CampaignRecipient[]
+  sends      Send[]
+
+  @@map("campaigns")
+  @@index([agencyId])
+  @@index([clientId, archived, status, createdAt(sort: Desc)])  // hot path: list filtered by status
+}
+
+/* CampaignRecipient — immutable snapshot of who gets the campaign.
+   Written at launch time from the list's current contacts; never edited.
+   Composite primary key (campaignId, email) prevents within-campaign
+   duplicates even if the list contained the same contact twice. */
+model CampaignRecipient {
+  campaignId String  @map("campaign_id")
+  email      String                                // frozen at snapshot
+  firstName  String? @map("first_name")
+  lastName   String? @map("last_name")
+  contactId  String? @map("contact_id")            // null if list contained stragglers (V2 manual entry)
+  mergeData  Json?   @map("merge_data")            // V2: custom field substitution
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  contact  Contact? @relation(fields: [contactId],  references: [id], onDelete: SetNull)
+
+  @@id([campaignId, email])
+  @@map("campaign_recipients")
+  @@index([campaignId])
+  @@index([contactId])
+}
+
+/* Send — per-recipient send attempt log.
+   One row per call to Resend. status + error capture the outcome.
+   resendMessageId UNIQUE is forward-compat for V2 webhook ingestion
+   (deliver / bounce / complaint events keyed by message-id). */
+model Send {
+  id              String     @id @default(cuid())
+  campaignId      String     @map("campaign_id")
+  toEmail         String     @map("to_email")     // duplicates CampaignRecipient.email for log clarity
+  resendMessageId String?    @unique @map("resend_message_id")
+  status          SendStatus @default(queued)
+  error           String?                          // Resend's reason on failure
+  sentAt          DateTime?  @map("sent_at")
+  createdAt       DateTime   @default(now()) @map("created_at")
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@map("sends")
+  @@index([campaignId, status])                    // report aggregation
+  @@index([campaignId, createdAt(sort: Desc)])     // recipient log ordering
 }
