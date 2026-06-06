@@ -25,6 +25,10 @@ interface EmailJob {
   subject: string;
   text: string;
   html?: string;
+  /** Optional reply-to. Used by test sends so the user can hit reply and
+      land back on their own inbox even though the from address is
+      onboarding@resend.dev. */
+  replyTo?: string;
 }
 
 function consoleStub(job: EmailJob, reason: string): void {
@@ -37,10 +41,18 @@ function consoleStub(job: EmailJob, reason: string): void {
   console.log('└─────────────────────────────────────────────────────────────\n');
 }
 
-async function dispatch(job: EmailJob): Promise<void> {
+/** Result shape — `messageId` is populated when Resend actually delivered
+    the request to its outbound queue. On stub fallback or Resend error it
+    stays undefined; callers that need a guarantee (e.g. test-send) should
+    treat that as a failure and surface a toast. */
+interface DispatchResult {
+  messageId?: string;
+}
+
+async function dispatch(job: EmailJob): Promise<DispatchResult> {
   if (!resend) {
     consoleStub(job, 'stub — RESEND_API_KEY not set');
-    return;
+    return {};
   }
   try {
     const result = await resend.emails.send({
@@ -48,17 +60,20 @@ async function dispatch(job: EmailJob): Promise<void> {
       to:      job.to,
       subject: job.subject,
       text:    job.text,
-      ...(job.html ? { html: job.html } : {}),
+      ...(job.html    ? { html:     job.html    } : {}),
+      ...(job.replyTo ? { reply_to: job.replyTo } : {}),
     });
     if (result.error) {
       console.error('[email] Resend error:', result.error);
       consoleStub(job, `Resend failed → ${result.error.message ?? 'unknown'}`);
-      return;
+      return {};
     }
     console.log(`📧 [email sent via Resend] ${job.subject} → ${job.to} (id: ${result.data?.id})`);
+    return { messageId: result.data?.id };
   } catch (err) {
     console.error('[email] Resend exception:', err);
     consoleStub(job, 'Resend threw — falling back');
+    return {};
   }
 }
 
@@ -124,4 +139,44 @@ export function sendInvitation(opts: {
       '— The SendMyMail team',
     ].filter(Boolean).join('\n'),
   });
+}
+
+/* ─── Generic HTML send (used by template Test Send) ─────────────────────── */
+
+/**
+ * Send a pre-rendered HTML email. Used by the template builder's
+ * "Send test" feature — the MJML editor's compiled HTML is shipped
+ * straight to a single recipient so the user can preview the email
+ * in a real inbox.
+ *
+ * `replyTo` is recommended: the FROM address (`onboarding@resend.dev`
+ * by default) is not yours — setting `replyTo` to the user's email
+ * means any "Reply" lands in their inbox.
+ *
+ * Returns `{ messageId }` on success, throws on failure. (The 3
+ * transactional helpers above swallow failures because they're
+ * fire-and-forget side effects; test send is user-initiated and
+ * should surface errors.)
+ */
+export async function sendRawHtml(opts: {
+  to: string;
+  subject: string;
+  html: string;
+  replyTo?: string;
+  /** Optional plain-text fallback. Defaults to a short note pointing the
+      user at the HTML version — adequate for transactional / test sends;
+      campaigns should generate proper plain-text from the MJML tree. */
+  text?: string;
+}): Promise<{ messageId: string }> {
+  const result = await dispatch({
+    to:      opts.to,
+    subject: opts.subject,
+    html:    opts.html,
+    text:    opts.text ?? 'View this email in an HTML-capable client to see the formatted version.',
+    replyTo: opts.replyTo,
+  });
+  if (!result.messageId) {
+    throw new Error('Email send failed. Check the backend logs for the Resend error.');
+  }
+  return { messageId: result.messageId };
 }

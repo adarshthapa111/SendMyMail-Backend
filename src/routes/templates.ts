@@ -5,6 +5,8 @@ import { prisma } from '../lib/prisma';
 import { requireAuth, requireClientScope, requireRole } from '../middleware/auth';
 import { notFound, badRequest } from '../lib/errors';
 import { writeAudit } from '../lib/audit';
+import { sendRawHtml } from '../lib/email';
+import { mjml2htmlProcessed } from '../mjml/mjmlWrapper';
 
 /* /v1/clients/:clientId/templates — PR 2 of feature-templates.
    ──────────────────────────────────────────────────────────────
@@ -19,6 +21,7 @@ import { writeAudit } from '../lib/audit';
      PATCH  /:id             — update (admin) — strips editor-only fields + mj-preview nodes
      DELETE /:id             — soft-archive (admin)
      POST   /:id/duplicate   — deep clone (admin) — appends " (copy)" to name
+     POST   /:id/test-send   — compile + send the saved tree to one address (any member)
    ────────────────────────────────────────────────────────────── */
 
 export const templatesRouter = Router({ mergeParams: true });
@@ -391,6 +394,98 @@ templatesRouter.post('/:id/duplicate', requireAuth(), requireRole('admin'), requ
     });
 
     res.status(201).json({ data: { template: serializeFull(created) } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ─── POST /:id/test-send — send the saved template to one address ───────── */
+
+/* Compile mjmlSource → HTML → ship via Resend. Auth is `requireAuth +
+   requireClientScope` (NOT admin) — any team member with client access can
+   verify their own work in a real inbox.
+
+   Frontend contract: caller is expected to have SAVED the template first
+   (the editor's "Send test" button auto-saves dirty templates before
+   calling this route, so Cloudinary uploads complete and the persisted
+   mjmlSource is the latest version). We don't accept a tree in the body —
+   keeps the endpoint contract small and the "send what's saved" semantics
+   honest.
+
+   Resend constraint note: with the default `onboarding@resend.dev` sender
+   and no verified domain, Resend ONLY delivers to the email used at signup.
+   Other recipients will 403. The error bubbles to the frontend toast. */
+
+const testSendBody = z.object({
+  toEmail:  z.email({ message: 'Must be a valid email address.' }),
+  subject:  z.string().min(1).max(200).optional(),
+});
+
+templatesRouter.post('/:id/test-send', requireAuth(), requireClientScope, async (req, res, next) => {
+  try {
+    const body = testSendBody.parse(req.body);
+    await assertClientExists(req);
+    const template = await loadTemplateOr404(req, String(req.params.id ?? ''));
+    const agencyId = req.auth!.agency_id;
+    const userId   = req.auth!.sub;
+
+    /* Look up the caller's email to use as Reply-To. The JWT carries only
+       the user id; we hit the users table for the address. If the lookup
+       fails (deleted user, race), we proceed without replyTo — the test
+       still sends, replies just won't bounce back to the user. */
+    const user = await prisma.user.findUnique({
+      where:  { id: userId },
+      select: { email: true },
+    });
+
+    /* mjmlSource is JSON in the DB — cast to the shape mjml2htmlProcessed
+       expects. The wrapper mutates the tree in place (transformSocialToRaw),
+       so we don't need to clone; the in-memory copy is throwaway. */
+    const compiled = mjml2htmlProcessed(template.mjmlSource);
+    if (!compiled.html) {
+      return next(badRequest('mjml_compile_failed', 'Template did not compile to HTML. Check the editor for errors.'));
+    }
+    if (compiled.errors?.length) {
+      // Log but don't block — MJML's "errors" array commonly contains warnings
+      // (missing alt text, unrecognized attribute) that still produce valid HTML.
+      console.warn(`[test-send] template ${template.id} compiled with ${compiled.errors.length} warning(s)`);
+    }
+
+    const subject = body.subject?.trim() || `[Test] ${template.name}`;
+
+    let messageId: string;
+    try {
+      const result = await sendRawHtml({
+        to:      body.toEmail,
+        subject,
+        html:    compiled.html,
+        replyTo: user?.email,
+      });
+      messageId = result.messageId;
+    } catch (err) {
+      // Resend rejection (unverified domain, invalid recipient, throttle, etc.)
+      // Surface a 400 with the reason so the frontend toast can show the cause.
+      const reason = err instanceof Error ? err.message : 'Unknown email send error';
+      return next(badRequest('email_send_failed', `Email send failed: ${reason}`));
+    }
+
+    writeAudit({
+      agencyId,
+      actorUserId: userId,
+      action:      'template.test_sent',
+      targetType:  'template',
+      targetId:    template.id,
+      metadata:    {
+        clientId:  template.clientId,
+        toEmail:   body.toEmail,
+        subject,
+        messageId,
+        // NOT the html — would inflate the audit table for no observability gain
+      },
+      req,
+    });
+
+    res.json({ data: { messageId, to: body.toEmail, subject } });
   } catch (err) {
     next(err);
   }
