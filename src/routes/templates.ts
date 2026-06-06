@@ -262,10 +262,16 @@ templatesRouter.post('/', requireAuth(), requireRole('admin'), requireClientScop
 /* ─── PATCH /:id — update (admin) ────────────────────────────────────────── */
 
 const updateBody = z.object({
-  name:       z.string().trim().min(1).max(120).optional(),
-  category:   z.string().trim().max(40).nullable().optional(),
-  mjmlSource: z.unknown().optional(),
-  archived:   z.boolean().optional(),
+  name:         z.string().trim().min(1).max(120).optional(),
+  category:     z.string().trim().max(40).nullable().optional(),
+  mjmlSource:   z.unknown().optional(),
+  archived:     z.boolean().optional(),
+  /* thumbnailUrl is set by the frontend's background thumbnail-generation
+     pipeline after save (compile MJML → screenshot iframe → upload to
+     Cloudinary). It's a separate "silent" PATCH so it doesn't trigger
+     toasts or block the user. URL is Cloudinary-hosted; we don't
+     validate the host but cap length to prevent abuse. */
+  thumbnailUrl: z.url().max(2000).nullable().optional(),
 }).strict();
 
 templatesRouter.patch('/:id', requireAuth(), requireRole('admin'), requireClientScope, async (req, res, next) => {
@@ -294,6 +300,10 @@ templatesRouter.patch('/:id', requireAuth(), requireRole('admin'), requireClient
     if (body.archived !== undefined && body.archived !== existing.archived) {
       data.archived = body.archived;
       changes.archived = { from: existing.archived, to: body.archived };
+    }
+    if (body.thumbnailUrl !== undefined && body.thumbnailUrl !== existing.thumbnailUrl) {
+      data.thumbnailUrl = body.thumbnailUrl;
+      changes.thumbnailUrl = true;        // URL itself isn't interesting in audit
     }
 
     if (Object.keys(data).length === 0) {
