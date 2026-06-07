@@ -11,6 +11,7 @@ import { listsRouter } from './routes/lists';
 import { tagsRouter } from './routes/tags';
 import { templatesRouter } from './routes/templates';
 import { campaignsRouter } from './routes/campaigns';
+import { onboardingRouter } from './routes/onboarding';
 import { errorHandler, requestId } from './lib/errors';
 import { jsonToHtml } from './controllers/jsonToHtml';
 import { jsonToMjml } from './controllers/jsonToMjml';
@@ -55,6 +56,7 @@ app.use('/v1/clients/:clientId/lists',            listsRouter);
 app.use('/v1/clients/:clientId/tags',             tagsRouter);
 app.use('/v1/clients/:clientId/templates',        templatesRouter);
 app.use('/v1/clients/:clientId/campaigns',        campaignsRouter);
+app.use('/v1/onboarding',                         onboardingRouter);
 
 // MJML pipeline (preview / copy)
 app.post('/getHtml', jsonToHtml);
