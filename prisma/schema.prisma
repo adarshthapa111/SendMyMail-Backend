@@ -108,6 +108,11 @@ enum SuppressionReason {
   complaint     // V2 — same
 }
 
+enum EmailEventType {
+  open
+  click
+}
+
 // ─── Tenant + users ──────────────────────────────────────────────────────────
 
 model Agency {
@@ -558,11 +563,51 @@ model Send {
   sentAt          DateTime?  @map("sent_at")
   createdAt       DateTime   @default(now()) @map("created_at")
 
-  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  // ── Engagement aggregates (feature-engagement-tracking V1) ──────
+  // Incremented atomically when EmailEvent rows are inserted. Duplicated
+  // state for fast list/report reads — full event detail lives in EmailEvent.
+  openCount       Int        @default(0)  @map("open_count")
+  clickCount      Int        @default(0)  @map("click_count")
+  firstOpenedAt   DateTime?               @map("first_opened_at")
+  lastClickedAt   DateTime?               @map("last_clicked_at")
+
+  campaign Campaign     @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  events   EmailEvent[]
 
   @@map("sends")
   @@index([campaignId, status])                    // report aggregation
   @@index([campaignId, createdAt(sort: Desc)])     // recipient log ordering
+}
+
+/* Engagement event — one row per open or click recorded on a sent email.
+   See feature-engagement-tracking V1.
+
+   Multiple events per Send are expected:
+     - Recipient opens email at 9am, again at 3pm → 2 'open' rows
+     - Recipient clicks link, clicks again on same link → 2 'click' rows
+     - Recipient clicks 3 different links → 3 'click' rows
+
+   "Unique" counts (surfaced in reports as the standard metric) are derived
+   from Send.openCount + Send.clickCount which are incremented ONLY on the
+   first event of each (Send, type[, url]) combination. */
+model EmailEvent {
+  id          String         @id @default(cuid())
+  sendId      String         @map("send_id")
+  type        EmailEventType
+  /// 'click': the URL the recipient clicked. 'open': null.
+  url         String?
+  /// Best-effort recipient IP (X-Forwarded-For preferred over remoteAddr).
+  /// Used for the per-recipient log; never displayed publicly.
+  recipientIp String?        @map("recipient_ip")
+  /// User-Agent string. V2 sniffs this for MPP / bot filtering.
+  userAgent   String?        @map("user_agent")    @db.VarChar(500)
+  occurredAt  DateTime       @default(now())       @map("occurred_at")
+
+  send Send @relation(fields: [sendId], references: [id], onDelete: Cascade)
+
+  @@map("email_events")
+  @@index([sendId, type])                          // report aggregation
+  @@index([sendId, occurredAt(sort: Desc)])        // event log ordering
 }
 
 /* Sending domain verification — feature-send-hardening V1.

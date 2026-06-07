@@ -34,6 +34,7 @@ import {
   applyMergeTagsSubject,
   injectUnsubscribeFooter,
 } from './merge';
+import { injectTracking } from './html-tracking';
 import { signUnsubToken } from '../lib/unsubscribe-token';
 import { findVerifiedDomain } from '../lib/sending-domain';
 
@@ -279,6 +280,24 @@ async function runSendLoop(campaignId: string, actorUserId: string): Promise<voi
          unsubscribe_url — applyMergeTagsSubject strips it). */
       const subject = applyMergeTagsSubject(campaign.subject, mergeValues);
 
+      /* INSERT Send row BEFORE sendRawHtml so we have a sendId to
+         use for engagement tracking tokens. Status starts as 'queued'
+         (a SendStatus enum value reserved exactly for this transition);
+         we UPDATE to 'sent' or 'failed' after Resend returns. */
+      const sendRow = await prisma.send.create({
+        data: {
+          campaignId,
+          toEmail: recipient.email,
+          status:  'queued',
+        },
+        select: { id: true },
+      });
+
+      /* Engagement tracking: rewrite hrefs through /e/c/{token} and
+         inject a 1×1 tracking pixel before </body>. Tokens sign with
+         this Send's id so events route back to the right row. */
+      html = injectTracking(html, sendRow.id);
+
       let resendMessageId: string | undefined;
       let sendStatus: 'sent' | 'failed' = 'sent';
       let errorReason: string | undefined;
@@ -300,14 +319,13 @@ async function runSendLoop(campaignId: string, actorUserId: string): Promise<voi
         failedCount++;
       }
 
-      await prisma.send.create({
+      await prisma.send.update({
+        where: { id: sendRow.id },
         data: {
-          campaignId,
-          toEmail:         recipient.email,
           resendMessageId,
-          status:          sendStatus,
-          error:           errorReason,
-          sentAt:          sendStatus === 'sent' ? new Date() : null,
+          status: sendStatus,
+          error:  errorReason,
+          sentAt: sendStatus === 'sent' ? new Date() : null,
         },
       });
 

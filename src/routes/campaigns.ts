@@ -131,11 +131,73 @@ campaignsRouter.get('/:id', requireAuth(), requireClientScope, async (req, res, 
   try {
     await assertClientExists(req);
     const row = await loadCampaignOr404(req, String(req.params.id ?? ''));
-    res.json({ data: { campaign: row } });
+    const engagement = await computeEngagement(row.id, row.sentCount);
+    res.json({ data: { campaign: { ...row, ...engagement } } });
   } catch (err) {
     next(err);
   }
 });
+
+/* Engagement aggregates — feature-engagement-tracking V1.
+   Computed at request time from the Send aggregates (openCount / clickCount).
+   Cheap: two COUNT queries on indexed columns + an optional GROUP BY for
+   top links. Drafts skip everything (no Sends exist yet). */
+interface EngagementStats {
+  uniqueOpens:  number;          // Sends where firstOpenedAt is not null
+  uniqueClicks: number;          // Sends where clickCount > 0
+  openRate:     number | null;   // null when sentCount is 0
+  clickRate:    number | null;
+  topLinks:     Array<{ url: string; count: number }>;
+}
+
+async function computeEngagement(campaignId: string, sentCount: number): Promise<EngagementStats> {
+  if (sentCount === 0) {
+    return {
+      uniqueOpens:  0,
+      uniqueClicks: 0,
+      openRate:     null,
+      clickRate:    null,
+      topLinks:     [],
+    };
+  }
+
+  const [uniqueOpens, uniqueClicks] = await Promise.all([
+    prisma.send.count({
+      where: { campaignId, firstOpenedAt: { not: null } },
+    }),
+    prisma.send.count({
+      where: { campaignId, clickCount: { gt: 0 } },
+    }),
+  ]);
+
+  /* Top links: aggregate click events grouped by URL. Skip the query
+     when uniqueClicks is 0 — no clicks means no URLs to surface. */
+  let topLinks: Array<{ url: string; count: number }> = [];
+  if (uniqueClicks > 0) {
+    const grouped = await prisma.emailEvent.groupBy({
+      by:       ['url'],
+      where:    {
+        send: { campaignId },
+        type: 'click',
+        url:  { not: null },
+      },
+      _count:   { _all: true },
+      orderBy:  { _count: { id: 'desc' } },
+      take:     10,
+    });
+    topLinks = grouped
+      .filter((g) => g.url !== null)
+      .map((g) => ({ url: g.url as string, count: g._count._all }));
+  }
+
+  return {
+    uniqueOpens,
+    uniqueClicks,
+    openRate:  uniqueOpens  / sentCount,
+    clickRate: uniqueClicks / sentCount,
+    topLinks,
+  };
+}
 
 /* ─── POST / — create draft (admin) ──────────────────────────────────────── */
 

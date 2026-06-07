@@ -15,6 +15,7 @@ import { onboardingRouter } from './routes/onboarding';
 import { sendingDomainsRouter } from './routes/sending-domains';
 import { suppressionRouter } from './routes/suppression';
 import { unsubscribeRouter } from './routes/unsubscribe';
+import { trackingRouter } from './routes/tracking';
 import { errorHandler, requestId } from './lib/errors';
 import { jsonToHtml } from './controllers/jsonToHtml';
 import { jsonToMjml } from './controllers/jsonToMjml';
@@ -63,6 +64,7 @@ app.use('/v1/onboarding',                         onboardingRouter);
 app.use('/v1/sending-domains',                    sendingDomainsRouter);
 app.use('/v1/clients/:clientId/suppressions',     suppressionRouter);
 app.use('/u',                                     unsubscribeRouter);   // public, root-mounted for short URLs
+app.use('/e',                                     trackingRouter);      // public engagement tracking (opens + clicks)
 
 // MJML pipeline (preview / copy)
 app.post('/getHtml', jsonToHtml);
