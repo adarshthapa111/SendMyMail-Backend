@@ -95,6 +95,19 @@ enum SendStatus {
   failed       // Resend rejected or threw; reason in `error`
 }
 
+enum DomainStatus {
+  pending      // Just added, awaiting DNS propagation + Resend verification
+  verified     // Resend confirmed all DKIM/SPF/MX records pass
+  failed       // Verification failed; user can re-check after fixing DNS
+}
+
+enum SuppressionReason {
+  manual        // Added by admin via UI
+  unsubscribe   // User clicked the unsubscribe link
+  hard_bounce   // V2 — when webhook ingestion lands
+  complaint     // V2 — same
+}
+
 // ─── Tenant + users ──────────────────────────────────────────────────────────
 
 model Agency {
@@ -117,7 +130,9 @@ model Agency {
   contacts    Contact[]
   importJobs  ImportJob[]
   templates   Template[]
-  campaigns   Campaign[]
+  campaigns       Campaign[]
+  sendingDomains  SendingDomain[]
+  suppressions    Suppression[]
 
   @@map("agencies")
   @@index([subdomain])
@@ -548,4 +563,68 @@ model Send {
   @@map("sends")
   @@index([campaignId, status])                    // report aggregation
   @@index([campaignId, createdAt(sort: Desc)])     // recipient log ordering
+}
+
+/* Sending domain verification — feature-send-hardening V1.
+   Lets agencies verify a domain via Resend so campaigns can send from
+   their own address (campaigns@mail.foo.com) instead of the
+   onboarding@resend.dev fallback.
+
+   Resend free tier: 1 domain per team. Pro tier: 10. Schema supports
+   multi-domain so upgrading shows additional rows in the UI without
+   migration.
+
+   Verification mechanics: we don't verify ourselves — Resend does the
+   DNS lookups. Our role is:
+     1. POST to Resend.domains.create → get DNS records to display
+     2. Show records to user → they add them to their DNS provider
+     3. User clicks "Check now" → we ask Resend.domains.verify
+     4. We persist the resulting status. */
+model SendingDomain {
+  id            String       @id @default(cuid())
+  agencyId      String       @map("agency_id")
+  name          String                                      // e.g. "mail.khukrispices.com"
+  resendId      String?      @unique @map("resend_id")      // Resend's domain id (for API ops)
+  status        DomainStatus @default(pending)
+  /// DNS records returned by Resend.domains.create. Array of
+  /// { record: 'CNAME'|'TXT'|'MX', name, value, ttl, priority?, status }
+  records       Json
+  verifiedAt    DateTime?    @map("verified_at")
+  lastCheckedAt DateTime?    @map("last_checked_at")
+  createdAt     DateTime     @default(now()) @map("created_at")
+  updatedAt     DateTime     @updatedAt @map("updated_at")
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@map("sending_domains")
+  @@unique([agencyId, name])                              // one agency can't add same domain twice
+  @@index([agencyId, status])                             // hot path: agency's verified domain
+}
+
+/* Suppression list — emails we should never mail from this agency,
+   for any list. Populated by:
+     - Explicit unsubscribe clicks (reason: 'unsubscribe')
+     - Manual admin adds (reason: 'manual')
+     - V2: hard bounces + complaints via webhook ingestion
+
+   Per-agency scope (not per-list, not per-client) — if a recipient
+   unsubscribes from ANY list, we never mail them from this agency
+   again across all of its clients. Stricter than per-list but right
+   thing legally. Per-list fine-grained subscription tracking already
+   lives in ListContact.status. */
+model Suppression {
+  id        String            @id @default(cuid())
+  agencyId  String            @map("agency_id")
+  email     String                                        // canonicalised to lowercase before insert
+  reason    SuppressionReason
+  /// Optional context — "Unsubscribed from Welcome list" / "Marked
+  /// spammy in admin UI" — for audit + display in the suppression page.
+  note      String?
+  createdAt DateTime          @default(now()) @map("created_at")
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@map("suppressions")
+  @@unique([agencyId, email])                             // one row per (agency, email)
+  @@index([agencyId])
 }

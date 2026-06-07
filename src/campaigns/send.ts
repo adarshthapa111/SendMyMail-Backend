@@ -5,14 +5,18 @@
  *   POST /campaigns/:id/launch handler →
  *     1. LOCK + transition campaign to 'sending'
  *     2. SNAPSHOT recipients from the list into campaign_recipients
- *     3. RENDER template once via mjml2htmlProcessed
- *     4. LOOP per recipient: merge tags → sendRawHtml → write Send row
- *     5. FINALIZE counts + status
+ *     3. LOAD suppression list (agency-wide)
+ *     4. RESOLVE FROM address (verified sending domain if available)
+ *     5. RENDER template once via mjml2htmlProcessed
+ *     6. LOOP per recipient: skip if suppressed, else merge tags +
+ *        inject unsubscribe footer if missing → sendRawHtml → write
+ *        Send row
+ *     7. FINALIZE counts + status
  *
  * Why synchronous (not BullMQ V1): most agency campaigns ≤500 recipients.
- * ~170ms between sends = ~85s loop = well within an Express request
+ * ~220ms between sends = ~110s loop = well within an Express request
  * handler's lifetime. The handler RESPONDS to the caller after step 2
- * (snapshot done) and step 3-5 continue in the background of the same
+ * (snapshot done) and step 3-7 continue in the background of the same
  * Node.js event loop. The frontend polls GET /campaigns/:id every 5s
  * to track progress.
  *
@@ -25,10 +29,22 @@ import { prisma } from '../lib/prisma';
 import { mjml2htmlProcessed } from '../mjml/mjmlWrapper';
 import { sendRawHtml } from '../lib/email';
 import { writeAudit } from '../lib/audit';
-import { applyMergeTags } from './merge';
+import {
+  applyMergeTags,
+  applyMergeTagsSubject,
+  injectUnsubscribeFooter,
+} from './merge';
+import { signUnsubToken } from '../lib/unsubscribe-token';
+import { findVerifiedDomain } from '../lib/sending-domain';
 
-const SEND_RATE_MS = 170;             // ~6 req/sec — under Resend's 10/sec free-tier ceiling
+/* Rate limit: Resend's free-tier ceiling is 5 req/sec. 220ms = ~4.5 req/sec
+   stays safely under. The earlier 170ms (~5.88 req/sec) tripped 429s on
+   campaigns >50 recipients. Adds ~30% to total loop time on large sends
+   but keeps the API happy. */
+const SEND_RATE_MS = 220;
 const COUNTER_FLUSH_EVERY = 25;       // update campaign.sentCount / failedCount every N sends
+
+const APP_URL = process.env.APP_URL || 'http://localhost:5173';
 
 type LaunchError =
   | { code: 'not_found' }
@@ -53,10 +69,6 @@ export type LaunchResult = LaunchOk | LaunchFail;
  * recipients. Returns synchronously. The actual send loop runs in the
  * background — the caller doesn't await it. The caller awaits this
  * function, which only completes after the snapshot is durable.
- *
- * The "fire-and-forget" pattern: we schedule the send loop with
- * `void runSendLoop(...)` after responding to the HTTP request. Node.js
- * keeps the event loop alive until the loop completes.
  */
 export async function launchCampaign(
   campaignId: string,
@@ -89,11 +101,7 @@ export async function launchCampaign(
 
   const row = campaign.row;
 
-  /* 2. Snapshot recipients from the list.
-        Filters: contact not soft-deleted; list membership status active.
-        We accept a tiny race here — a contact added/removed in the
-        microseconds between the SELECT and the createMany doesn't matter
-        for V1; for V2 we may wrap this in an advisory lock. */
+  /* 2. Snapshot recipients. */
   const contacts = await prisma.contact.findMany({
     where: {
       clientId: row.clientId,
@@ -106,7 +114,6 @@ export async function launchCampaign(
   });
 
   if (contacts.length === 0) {
-    // Roll the campaign back to draft so the user can fix the list.
     await prisma.campaign.update({
       where: { id: campaignId },
       data:  { status: 'draft' },
@@ -123,7 +130,7 @@ export async function launchCampaign(
         firstName: c.firstName,
         lastName:  c.lastName,
       })),
-      skipDuplicates: true,                // composite-PK collisions are fine
+      skipDuplicates: true,
     }),
     prisma.campaign.update({
       where: { id: campaignId },
@@ -143,9 +150,7 @@ export async function launchCampaign(
     metadata:    { totalRecipients: contacts.length, listId: row.listId, templateId: row.templateId },
   });
 
-  /* 3-5. Background send loop. void = no await; the HTTP handler
-          returns immediately. Node.js keeps the process alive until
-          the loop drains. */
+  /* Background send loop. */
   void runSendLoop(campaignId, actorUserId);
 
   return { ok: true, totalRecipients: contacts.length };
@@ -153,20 +158,22 @@ export async function launchCampaign(
 
 /**
  * The send loop. Runs in the background after launchCampaign returns.
- * Crashes here don't propagate — they're caught and logged so a single
- * bad recipient doesn't break the loop. The campaign ends up in 'sent'
- * (if ≥1 succeeded) or 'failed' (if all failed).
+ * Each per-recipient try/catch keeps one bad email from breaking the
+ * whole loop. The outer try/catch handles unhandled throws (DB outage,
+ * etc.) by best-effort marking the campaign 'failed' so it doesn't sit
+ * in 'sending' forever.
  */
 async function runSendLoop(campaignId: string, actorUserId: string): Promise<void> {
   try {
     const campaign = await prisma.campaign.findUnique({
       where:  { id: campaignId },
       select: {
-        agencyId: true,
-        subject: true,
-        fromEmail: true,
-        fromName: true,
+        agencyId:   true,
+        subject:    true,
+        fromEmail:  true,
+        fromName:   true,
         templateId: true,
+        listId:     true,
       },
     });
     if (!campaign || !campaign.templateId || !campaign.subject) {
@@ -198,6 +205,30 @@ async function runSendLoop(campaignId: string, actorUserId: string): Promise<voi
     }
     const baseHtml = compiled.html;
 
+    /* ── Load agency context for FROM resolution + suppression check ── */
+
+    const agency = await prisma.agency.findUnique({
+      where:  { id: campaign.agencyId },
+      select: { name: true },
+    });
+    const agencyName = agency?.name ?? 'SendMyMail';
+
+    const verifiedDomain = await findVerifiedDomain(campaign.agencyId);
+    const fromOverride = verifiedDomain
+      ? `${agencyName} <campaigns@${verifiedDomain.name}>`
+      : undefined;
+
+    /* Load suppression list once, keep as a Set for O(1) lookup.
+       Memory: ~10 KB per 1000 entries. Safe up to ~100K entries
+       before we'd want a more efficient structure. */
+    const suppressed = await prisma.suppression.findMany({
+      where:  { agencyId: campaign.agencyId },
+      select: { email: true },
+    });
+    const suppressionSet = new Set(suppressed.map((s) => s.email.toLowerCase()));
+
+    /* ── Iterate recipients ─────────────────────────────────────────── */
+
     const recipients = await prisma.campaignRecipient.findMany({
       where:   { campaignId },
       orderBy: { email: 'asc' },          // deterministic ordering for resumability later
@@ -207,11 +238,46 @@ async function runSendLoop(campaignId: string, actorUserId: string): Promise<voi
     let failedCount = 0;
 
     for (const recipient of recipients) {
-      const html = applyMergeTags(baseHtml, {
-        first_name: recipient.firstName ?? '',
-        last_name:  recipient.lastName ?? '',
-        email:      recipient.email,
+      /* SUPPRESSION CHECK — skip without calling Resend. Record as
+         failed in the Send table so the report shows what happened. */
+      if (suppressionSet.has(recipient.email.toLowerCase())) {
+        await prisma.send.create({
+          data: {
+            campaignId,
+            toEmail:         recipient.email,
+            resendMessageId: null,
+            status:          'failed',
+            error:           'Recipient is in agency suppression list',
+            sentAt:          null,
+          },
+        });
+        failedCount++;
+        continue;                          // NO sleep — we didn't hit Resend
+      }
+
+      /* UNSUBSCRIBE TOKEN (per-recipient) */
+      const unsubToken = signUnsubToken({
+        contactId: recipient.contactId ?? '',
+        listId:    campaign.listId ?? '',
+        agencyId:  campaign.agencyId,
       });
+      const unsubUrl = `${APP_URL}/u/${unsubToken}`;
+
+      const mergeValues = {
+        first_name:      recipient.firstName ?? '',
+        last_name:       recipient.lastName ?? '',
+        email:           recipient.email,
+        unsubscribe_url: unsubUrl,
+      };
+
+      /* HTML body: substitute placeholders + inject footer if no
+         {{unsubscribe_url}} was in the template. */
+      let html = applyMergeTags(baseHtml, mergeValues);
+      html = injectUnsubscribeFooter(html, unsubUrl, agencyName);
+
+      /* Subject: substitute first_name / last_name / email (NOT
+         unsubscribe_url — applyMergeTagsSubject strips it). */
+      const subject = applyMergeTagsSubject(campaign.subject, mergeValues);
 
       let resendMessageId: string | undefined;
       let sendStatus: 'sent' | 'failed' = 'sent';
@@ -219,10 +285,12 @@ async function runSendLoop(campaignId: string, actorUserId: string): Promise<voi
 
       try {
         const result = await sendRawHtml({
-          to:      recipient.email,
-          subject: campaign.subject,
+          to:              recipient.email,
+          subject,
           html,
-          replyTo: campaign.fromEmail ?? undefined,
+          from:            fromOverride,                                 // verified domain when available
+          replyTo:         campaign.fromEmail ?? undefined,
+          listUnsubscribe: `<${unsubUrl}>`,                              // Gmail bulk-sender requirement
         });
         resendMessageId = result.messageId;
         sentCount++;
@@ -243,7 +311,6 @@ async function runSendLoop(campaignId: string, actorUserId: string): Promise<voi
         },
       });
 
-      // Flush counters periodically so the polling report sees progress
       if ((sentCount + failedCount) % COUNTER_FLUSH_EVERY === 0) {
         await prisma.campaign.update({
           where: { id: campaignId },
@@ -270,11 +337,15 @@ async function runSendLoop(campaignId: string, actorUserId: string): Promise<voi
       action:      'campaign.send_completed',
       targetType:  'campaign',
       targetId:    campaignId,
-      metadata:    { sentCount, failedCount, totalRecipients: recipients.length },
+      metadata:    {
+        sentCount,
+        failedCount,
+        totalRecipients:    recipients.length,
+        usedVerifiedDomain: !!verifiedDomain,
+      },
     });
   } catch (err) {
     console.error(`[send-loop] unhandled error in campaign ${campaignId}:`, err);
-    // Best-effort mark failed so it's not stuck in 'sending'
     try {
       await prisma.campaign.update({
         where: { id: campaignId },

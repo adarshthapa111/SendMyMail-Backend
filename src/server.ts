@@ -12,6 +12,9 @@ import { tagsRouter } from './routes/tags';
 import { templatesRouter } from './routes/templates';
 import { campaignsRouter } from './routes/campaigns';
 import { onboardingRouter } from './routes/onboarding';
+import { sendingDomainsRouter } from './routes/sending-domains';
+import { suppressionRouter } from './routes/suppression';
+import { unsubscribeRouter } from './routes/unsubscribe';
 import { errorHandler, requestId } from './lib/errors';
 import { jsonToHtml } from './controllers/jsonToHtml';
 import { jsonToMjml } from './controllers/jsonToMjml';
@@ -57,6 +60,9 @@ app.use('/v1/clients/:clientId/tags',             tagsRouter);
 app.use('/v1/clients/:clientId/templates',        templatesRouter);
 app.use('/v1/clients/:clientId/campaigns',        campaignsRouter);
 app.use('/v1/onboarding',                         onboardingRouter);
+app.use('/v1/sending-domains',                    sendingDomainsRouter);
+app.use('/v1/clients/:clientId/suppressions',     suppressionRouter);
+app.use('/u',                                     unsubscribeRouter);   // public, root-mounted for short URLs
 
 // MJML pipeline (preview / copy)
 app.post('/getHtml', jsonToHtml);
