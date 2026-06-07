@@ -113,6 +113,11 @@ enum EmailEventType {
   click
 }
 
+enum FormStatus {
+  active   // Accepting submissions
+  paused   // Form still renders but rejects submissions with "currently closed"
+}
+
 // ─── Tenant + users ──────────────────────────────────────────────────────────
 
 model Agency {
@@ -138,6 +143,7 @@ model Agency {
   campaigns       Campaign[]
   sendingDomains  SendingDomain[]
   suppressions    Suppression[]
+  forms           Form[]
 
   @@map("agencies")
   @@index([subdomain])
@@ -214,6 +220,7 @@ model Client {
   importJobs ImportJob[]
   templates  Template[]
   campaigns  Campaign[]
+  forms      Form[]
 
   @@map("clients")
   @@unique([agencyId, slug])    // slug unique within an agency
@@ -338,6 +345,7 @@ model Contact {
   listMembers        ListContact[]
   contactTags        ContactTag[]
   campaignRecipients CampaignRecipient[]
+  formSubmissions    FormSubmission[]
 
   @@map("contacts")
   @@unique([clientId, emailLower])                  // the core dedupe rule
@@ -360,6 +368,7 @@ model List {
   members    ListContact[]
   importJobs ImportJob[]
   campaigns  Campaign[]
+  forms      Form[]
 
   @@map("lists")
   @@index([clientId, archived])
@@ -672,4 +681,87 @@ model Suppression {
   @@map("suppressions")
   @@unique([agencyId, email])                             // one row per (agency, email)
   @@index([agencyId])
+}
+
+/* Signup form — feature-forms V1.
+   Public URL: APP_URL/f/{slug}
+   slug is globally unique V1 (avoids agency-aware routing on public
+   endpoint). UI suggests `{agency-name}-{form-name}` prefix to make
+   collisions rare. V2 could move to subdomain routing if scale
+   demands. */
+model Form {
+  id              String     @id @default(cuid())
+  agencyId        String     @map("agency_id")
+  clientId        String     @map("client_id")
+  listId          String     @map("list_id")
+
+  slug            String     @unique           // URL-safe kebab-case
+  name            String                       // internal admin name
+
+  // Public-facing copy
+  headline        String?
+  subheadline     String?
+  buttonText      String     @default("Subscribe") @map("button_text")
+  thankYouMessage String     @default("Thanks! We'll be in touch.") @map("thank_you_message")
+
+  // Field toggles (V1: 3 known fields. V2: dynamic field array.)
+  collectFirstName Boolean   @default(false) @map("collect_first_name")
+  collectLastName  Boolean   @default(false) @map("collect_last_name")
+
+  // Theming
+  brandColor      String?    @map("brand_color")           // hex; null → use agency primary
+
+  // Compliance
+  requireConsent  Boolean    @default(false) @map("require_consent")
+  consentText     String?    @map("consent_text")          // shown next to checkbox
+
+  status          FormStatus @default(active)
+
+  // Denormalized for fast list rendering (incremented atomically
+  // with each successful submission).
+  submissionCount Int        @default(0) @map("submission_count")
+
+  archived        Boolean    @default(false)
+  createdAt       DateTime   @default(now()) @map("created_at")
+  updatedAt       DateTime   @updatedAt        @map("updated_at")
+
+  agency      Agency           @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  client      Client           @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  list        List             @relation(fields: [listId],   references: [id], onDelete: Restrict)
+  submissions FormSubmission[]
+
+  @@map("forms")
+  @@index([agencyId, archived])
+  @@index([clientId, archived])
+}
+
+/* Per-submission audit row. One per POST regardless of whether the
+   contact already existed (dedup happens at the Contact level).
+   isNewContact distinguishes "5 new signups" from "5 form submissions
+   (3 new + 2 re-submits)." */
+model FormSubmission {
+  id           String  @id @default(cuid())
+  formId       String  @map("form_id")
+  contactId    String? @map("contact_id")                  // null if email validation failed pre-Contact
+
+  email        String                                       // canonical (lowercase)
+  firstName    String? @map("first_name")
+  lastName     String? @map("last_name")
+
+  submittedIp  String? @map("submitted_ip")
+  userAgent    String? @map("user_agent")        @db.VarChar(500)
+  consentGiven Boolean @default(false) @map("consent_given")
+
+  /// True when this submission CREATED the Contact. False when
+  /// dedup matched an existing one.
+  isNewContact Boolean @default(true) @map("is_new_contact")
+
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  form    Form     @relation(fields: [formId],    references: [id], onDelete: Cascade)
+  contact Contact? @relation(fields: [contactId], references: [id], onDelete: SetNull)
+
+  @@map("form_submissions")
+  @@index([formId, createdAt(sort: Desc)])
+  @@index([formId, isNewContact])
 }
