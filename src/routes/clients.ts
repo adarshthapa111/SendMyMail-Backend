@@ -7,6 +7,10 @@ import { notFound, conflict } from '../lib/errors';
 import { writeAudit } from '../lib/audit';
 import { slugFromName } from '../lib/slug';
 import { invalidateOverview } from '../lib/overview';
+import {
+  aggregateSends, dailyChart, topCampaignsByEngagement, listGrowth,
+  subDaysUtc,
+} from '../lib/report';
 
 /* /v1/clients — full CRUD for clients (feature-client-management).
    READ:    GET /          (list)
@@ -250,3 +254,186 @@ clientsRouter.delete('/:id', requireAuth(), requireRole('admin'), async (req, re
     next(err);
   }
 });
+
+/* ─── GET /:id/report — per-client engagement report ──────────────────────
+   feature-reports V1. Cached 60s in-process per (clientId, range).
+   Returns the same shape regardless of range — the frontend re-renders
+   on range change.
+
+   range: 30d (default) | 90d | all */
+
+const REPORT_TTL_MS = 60_000;
+const reportCache = new Map<string, { payload: ClientReportPayload; expiresAt: number }>();
+const MAX_REPORT_CACHE_ENTRIES = 1_000;
+
+function reportCacheKey(clientId: string, range: string): string {
+  return `${clientId}:${range}`;
+}
+
+function trimReportCacheIfFull(): void {
+  if (reportCache.size < MAX_REPORT_CACHE_ENTRIES) return;
+  const drop = Math.ceil(MAX_REPORT_CACHE_ENTRIES * 0.1);
+  let dropped = 0;
+  for (const key of reportCache.keys()) {
+    if (dropped >= drop) break;
+    reportCache.delete(key);
+    dropped++;
+  }
+}
+
+const reportQuery = z.object({
+  range: z.enum(['30d', '90d', 'all']).optional().default('30d'),
+});
+
+interface ClientReportPayload {
+  client: { id: string; name: string };
+  range:  '30d' | '90d' | 'all';
+  kpis: {
+    sent_count:    number;
+    unique_opens:  number;
+    unique_clicks: number;
+    open_rate:     number | null;
+    click_rate:    number | null;
+    list_growth:   number;          // added - unsubscribed
+  };
+  sending_chart: Array<{ date_iso: string; sent: number; opened: number }>;
+  top_campaigns: Array<{
+    id:         string;
+    name:       string;
+    subject:    string | null;
+    sent_at:    string | null;
+    sent_count: number;
+    open_rate:  number | null;
+    click_rate: number | null;
+  }>;
+  list_health: {
+    total_contacts:     number;
+    subscribed_count:   number;
+    unsubscribed_count: number;
+    suppressed_count:   number;
+  };
+}
+
+clientsRouter.get('/:id/report', requireAuth(), async (req, res, next) => {
+  try {
+    const { range } = reportQuery.parse(req.query);
+    const clientId  = String(req.params.id ?? '');
+    const agencyId  = req.auth!.agency_id;
+
+    /* Scope check — member-scoped users can only read their accessible
+       clients' reports. */
+    const scope = req.auth!.scope;
+    if (scope.type === 'clients' && !scope.ids.includes(clientId)) {
+      throw notFound();
+    }
+
+    const client = await prisma.client.findFirst({
+      where:  { id: clientId, agencyId, status: { not: 'archived' } },
+      select: { id: true, name: true },
+    });
+    if (!client) throw notFound();
+
+    /* Cache check. */
+    const cacheKey = reportCacheKey(clientId, range);
+    const cached   = reportCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return res.json({ data: cached.payload });
+    }
+
+    /* Compute date range. "all" maps to a very old startAt — Postgres
+       handles the unbounded range fine on indexed columns. */
+    const now      = new Date();
+    const startAt  = range === '30d' ? subDaysUtc(now, 30)
+                   : range === '90d' ? subDaysUtc(now, 90)
+                   : new Date('2000-01-01T00:00:00Z');
+    const endAt    = now;
+
+    const aggBase = { agencyId, clientIds: [clientId], startAt, endAt };
+
+    const [agg, chart, top, growth, listHealth] = await Promise.all([
+      aggregateSends(aggBase),
+      dailyChart(aggBase),
+      topCampaignsByEngagement({ ...aggBase, limit: 5 }),
+      listGrowth(aggBase),
+      computeListHealth(clientId, agencyId),
+    ]);
+
+    const payload: ClientReportPayload = {
+      client: { id: client.id, name: client.name },
+      range,
+      kpis: {
+        sent_count:    agg.sentCount,
+        unique_opens:  agg.uniqueOpens,
+        unique_clicks: agg.uniqueClicks,
+        open_rate:     agg.openRate,
+        click_rate:    agg.clickRate,
+        list_growth:   growth.added - growth.unsubscribed,
+      },
+      sending_chart: chart,
+      top_campaigns: top.map((c) => ({
+        id:         c.id,
+        name:       c.name,
+        subject:    c.subject,
+        sent_at:    c.sentAt,
+        sent_count: c.sentCount,
+        open_rate:  c.openRate,
+        click_rate: c.clickRate,
+      })),
+      list_health: listHealth,
+    };
+
+    trimReportCacheIfFull();
+    reportCache.set(cacheKey, { payload, expiresAt: Date.now() + REPORT_TTL_MS });
+
+    res.json({ data: payload });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ─── List health snapshot (point-in-time, not range-scoped) ─────────── */
+
+async function computeListHealth(clientId: string, agencyId: string): Promise<{
+  total_contacts:     number;
+  subscribed_count:   number;
+  unsubscribed_count: number;
+  suppressed_count:   number;
+}> {
+  /* total_contacts = non-deleted contacts on this client.
+     subscribed_count + unsubscribed_count are summed across the client's lists
+     (a contact can be on multiple lists with different statuses; we count
+     ListContact rows for honest "list-level subscription" health).
+     suppressed_count is per-agency (suppression is agency-wide). */
+  const [totalContacts, subscribed, unsubscribed, suppressed] = await Promise.all([
+    prisma.contact.count({
+      where: { clientId, agencyId, deletedAt: null },
+    }),
+    prisma.listContact.count({
+      where: {
+        status: 'subscribed',
+        contact: { clientId, agencyId, deletedAt: null },
+      },
+    }),
+    prisma.listContact.count({
+      where: {
+        status: 'unsubscribed',
+        contact: { clientId, agencyId, deletedAt: null },
+      },
+    }),
+    prisma.suppression.count({
+      where: { agencyId },
+    }),
+  ]);
+  return {
+    total_contacts:     totalContacts,
+    subscribed_count:   subscribed,
+    unsubscribed_count: unsubscribed,
+    suppressed_count:   suppressed,
+  };
+}
+
+export function invalidateClientReport(clientId: string): void {
+  for (const key of reportCache.keys()) {
+    if (key.startsWith(`${clientId}:`)) reportCache.delete(key);
+  }
+}

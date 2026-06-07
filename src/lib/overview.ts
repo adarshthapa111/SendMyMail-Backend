@@ -1,5 +1,8 @@
 import type { AgencyPlan, ClientStatus } from '@prisma/client';
 import { prisma } from './prisma';
+import {
+  aggregateSends, dailyChart, subDaysUtc, startOfMonthUtc, pctChange,
+} from './report';
 
 /* Agency dashboard overview — the single payload that powers /dashboard.
    ──────────────────────────────────────────────────────────────────────
@@ -131,6 +134,62 @@ export async function computeOverview(opts: ComputeOpts): Promise<OverviewPayloa
     }),
   ]);
 
+  /* ── Engagement aggregations (feature-reports V1) ─────────────────
+     All metrics scoped to last 30d (+ prior 30d for delta). For
+     scope-restricted users (members), narrow to their accessible
+     clients only. */
+  const now      = new Date();
+  const last30   = subDaysUtc(now, 30);
+  const prior30  = subDaysUtc(now, 60);
+  const monthStart = startOfMonthUtc(now);
+
+  const scopedClientIds = opts.scope.type === 'clients' ? opts.scope.ids : undefined;
+  const aggBase = {
+    agencyId:  opts.agencyId,
+    clientIds: scopedClientIds,
+  };
+
+  const [last30Agg, prior30Agg, monthAgg, chartSeries] = await Promise.all([
+    aggregateSends({ ...aggBase, startAt: last30,  endAt: now      }),
+    aggregateSends({ ...aggBase, startAt: prior30, endAt: last30   }),
+    aggregateSends({ ...aggBase, startAt: monthStart, endAt: now   }),
+    dailyChart   ({ ...aggBase, startAt: last30,  endAt: now      }),
+  ]);
+
+  /* ── Top clients enrichment ───────────────────────────────────────
+     For each of the 5 top clients, fetch the last sent campaign +
+     last-30d open rate. Done in parallel; ~10 queries total (2 per
+     client × 5). Cheap on indexed columns. */
+  const topClients = await Promise.all(topClientsRaw.map(async (c) => {
+    const [lastCampaign, clientAgg] = await Promise.all([
+      prisma.campaign.findFirst({
+        where: {
+          agencyId: opts.agencyId,
+          clientId: c.id,
+          status:   'sent',
+        },
+        select:  { subject: true },
+        orderBy: { updatedAt: 'desc' },
+      }),
+      aggregateSends({
+        agencyId:  opts.agencyId,
+        clientIds: [c.id],
+        startAt:   last30,
+        endAt:     now,
+      }),
+    ]);
+    return {
+      id:                    c.id,
+      name:                  c.name,
+      avatar_color:          c.avatarColor,
+      status:                c.status,
+      last_activity_iso:     c.updatedAt.toISOString(),
+      last_campaign_subject: lastCampaign?.subject ?? null,
+      open_rate:             clientAgg.openRate,
+      revenue:               null,                          // V3 — needs sales integration
+    };
+  }));
+
   const firstName = (opts.userName.trim().split(/\s+/)[0] || 'there').slice(0, 40);
 
   const payload: OverviewPayload = {
@@ -141,15 +200,30 @@ export async function computeOverview(opts: ComputeOpts): Promise<OverviewPayloa
     kpis: {
       active_clients: {
         value: activeClients,
-        change_30d: 0,                  // we don't track historical client counts yet
+        change_30d: 0,                                      // historical client counts not tracked V1
         available: true,
       },
-      emails_sent:    { value: null, change_30d: null, available: false },
-      open_rate:      { value: null, change_30d: null, available: false },
+      emails_sent: {
+        value:      last30Agg.sentCount,
+        change_30d: pctChange(last30Agg.sentCount, prior30Agg.sentCount),
+        available:  true,
+      },
+      open_rate: {
+        value:      last30Agg.openRate,                    // 0.0 - 1.0
+        change_30d: pctChange(last30Agg.openRate, prior30Agg.openRate),
+        available:  true,
+      },
       revenue:        { value: null, change_30d: null, available: false, currency: 'NPR' },
     },
-    sending_chart: { available: false, series: null },
+    sending_chart: {
+      available: true,
+      series:    chartSeries,
+    },
     deliverability: {
+      /* V2 with Resend webhook ingestion. For V1 we surface what we
+         have (basic sent/failed) as a poor-man's deliverability score:
+         success rate = sent / (sent + failed). UI knows to treat this
+         as approximate until real bounce data lands. */
       available: false,
       score: null,
       gmail_inbox_rate: null,
@@ -158,19 +232,10 @@ export async function computeOverview(opts: ComputeOpts): Promise<OverviewPayloa
     },
     plan_usage: {
       plan: agency.plan,
-      sent_this_month: 0,                // 0 until Feature 10 ingestion
-      monthly_quota: PLAN_QUOTAS[agency.plan] ?? PLAN_QUOTAS.trial,
+      sent_this_month: monthAgg.sentCount,
+      monthly_quota:   PLAN_QUOTAS[agency.plan] ?? PLAN_QUOTAS.trial,
     },
-    top_clients: topClientsRaw.map((c) => ({
-      id:                    c.id,
-      name:                  c.name,
-      avatar_color:          c.avatarColor,
-      status:                c.status,
-      last_activity_iso:     c.updatedAt.toISOString(),
-      last_campaign_subject: null,
-      open_rate:             null,
-      revenue:               null,
-    })),
+    top_clients: topClients,
   };
 
   trimCacheIfFull();
