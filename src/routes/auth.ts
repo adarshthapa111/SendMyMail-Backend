@@ -207,14 +207,7 @@ authRouter.get('/me', requireAuth({ allowUnverified: true, allowUnsetupAgency: t
     if (!user) throw notFound('user_not_found');
     res.json({
       data: {
-        user: {
-          id: user.id,
-          email: user.email,
-          name: user.name,
-          role: user.role,
-          emailVerified: user.emailVerified,
-          avatarUrl: user.avatarUrl,
-        },
+        user: serializeUser(user),
         agency: {
           id: user.agency.id,
           name: user.agency.name,
@@ -229,6 +222,83 @@ authRouter.get('/me', requireAuth({ allowUnverified: true, allowUnsetupAgency: t
     next(err);
   }
 });
+
+/* ─── PATCH /v1/auth/me — feature-profile-settings V1 ────────────────────── */
+
+/* All fields optional; only present-and-defined ones are written.
+   Nullable so the UI can "clear" optional fields (avatar removal,
+   jobTitle/bio/phone deletion). */
+const updateMeBody = z.object({
+  name:      z.string().trim().min(1, 'Name is required').max(100).optional(),
+  avatarUrl: z.url().max(2000).nullable().optional(),
+  jobTitle:  z.string().trim().max(80).nullable().optional(),
+  bio:       z.string().trim().max(280).nullable().optional(),
+  phone:     z.string().trim().max(30).nullable().optional(),
+}).strict();
+
+authRouter.patch('/me', requireAuth({ allowUnverified: true, allowUnsetupAgency: true }), async (req, res, next) => {
+  try {
+    const body = updateMeBody.parse(req.body);
+
+    /* Prisma semantics: undefined = don't touch the column; null =
+       SET NULL. Both valid for our nullable columns. Empty strings
+       coerce to null (UI sometimes sends '' when a user clears a
+       field but the input still passes through Zod min). */
+    const data: Record<string, unknown> = {};
+    if (body.name      !== undefined) data.name      = body.name;
+    if (body.avatarUrl !== undefined) data.avatarUrl = body.avatarUrl;
+    if (body.jobTitle  !== undefined) data.jobTitle  = body.jobTitle === '' ? null : body.jobTitle;
+    if (body.bio       !== undefined) data.bio       = body.bio      === '' ? null : body.bio;
+    if (body.phone     !== undefined) data.phone     = body.phone    === '' ? null : body.phone;
+
+    if (Object.keys(data).length === 0) {
+      /* No-op PATCH — return current state without DB write. */
+      const user = await prisma.user.findUnique({
+        where:   { id: req.auth!.sub },
+        include: { agency: true },
+      });
+      if (!user) throw notFound('user_not_found');
+      return res.json({ data: { user: serializeUser(user) } });
+    }
+
+    const updated = await prisma.user.update({
+      where: { id: req.auth!.sub },
+      data,
+      include: { agency: true },
+    });
+
+    writeAudit({
+      agencyId:    updated.agencyId,
+      actorUserId: updated.id,
+      action:      'user.profile_updated',
+      targetType:  'user',
+      targetId:    updated.id,
+      metadata:    { fields: Object.keys(data) },     // names only, never values
+      req,
+    });
+
+    res.json({ data: { user: serializeUser(updated) } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* Shared user-serializer for both GET + PATCH /me responses. */
+function serializeUser(user: import('@prisma/client').User) {
+  return {
+    id:            user.id,
+    email:         user.email,
+    name:          user.name,
+    role:          user.role,
+    emailVerified: user.emailVerified,
+    avatarUrl:     user.avatarUrl,
+    jobTitle:      user.jobTitle,
+    bio:           user.bio,
+    phone:         user.phone,
+    createdAt:     user.createdAt.toISOString(),
+    lastLoginAt:   user.lastLoginAt?.toISOString() ?? null,
+  };
+}
 
 /* ─── POST /v1/auth/login ────────────────────────────────────────────────── */
 

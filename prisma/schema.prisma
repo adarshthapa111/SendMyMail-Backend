@@ -159,6 +159,12 @@ model User {
   role             UserRole
   scopeType        ScopeType @default(all) @map("scope_type")
   avatarUrl        String?   @map("avatar_url")
+  // ── Profile fields (feature-profile-settings V1) ─────────────────
+  // API-layer length limits enforced by zod; columns themselves are
+  // unbounded so future UX changes don't require migrations.
+  jobTitle         String?   @map("job_title")
+  bio              String?
+  phone            String?
   lastLoginAt      DateTime? @map("last_login_at")
   failedLoginCount Int       @default(0) @map("failed_login_count")
   lockedUntil      DateTime? @map("locked_until")
